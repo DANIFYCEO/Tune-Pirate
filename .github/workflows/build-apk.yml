@@ -28,7 +28,7 @@ jobs:
       working-directory: ./frontend
       run: npm run build
       env:
-        VITE_API_URL: https://tune-pirate-api.onrender.com
+        VITE_API_URL: https://tune-pirate.onrender.com
 
     - name: Sync Capacitor Android
       working-directory: ./frontend
