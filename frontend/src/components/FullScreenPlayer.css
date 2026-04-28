@@ -1,0 +1,702 @@
+/* ─────────────────────────────────────────
+   Full Screen Player (Spotify Canvas Style)
+   ───────────────────────────────────────── */
+
+.fsp-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  overflow: hidden;
+  transform: translateY(100%);
+  transition: transform 0.55s cubic-bezier(0.25, 1, 0.5, 1);
+}
+.fsp-overlay.open {
+  transform: translateY(0);
+}
+
+/* Blurred album art background */
+.fsp-bg {
+  position: absolute;
+  inset: -40px;
+  background-size: cover;
+  background-position: center;
+  filter: blur(60px) brightness(0.55) saturate(1.4);
+  z-index: 0;
+  transition: background-image 0.6s ease;
+}
+.fsp-bg-dim {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to bottom,
+    rgba(0,0,0,0.35) 0%,
+    rgba(0,0,0,0.15) 35%,
+    rgba(0,0,0,0.75) 70%,
+    rgba(0,0,0,0.92) 100%
+  );
+  z-index: 1;
+}
+
+/* Scrollable wrapper */
+.fsp-scroll {
+  position: relative;
+  z-index: 2;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ── Hero Section ── */
+.fsp-hero {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 100px 24px 32px;
+  box-sizing: border-box;
+}
+
+/* Top bar */
+.fsp-topbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 52px 20px 16px;
+  background: linear-gradient(to bottom, rgba(0,0,0,0.5), transparent);
+}
+.fsp-topbar-center {
+  text-align: center;
+  flex: 1;
+}
+.fsp-playing-from {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: rgba(255,255,255,0.7);
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+.fsp-context-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: white;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+  margin: 0 auto;
+}
+
+/* Icon button (circle glass) */
+.fsp-icon-btn {
+  background: rgba(255,255,255,0.12);
+  border: none;
+  color: white;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.2s;
+}
+.fsp-icon-btn:hover { background: rgba(255,255,255,0.22); }
+
+/* ── Album Artwork ── */
+.fsp-artwork-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  margin-bottom: 24px;
+}
+.fsp-artwork {
+  width: min(72vw, 300px);
+  height: min(72vw, 300px);
+  border-radius: 18px;
+  object-fit: cover;
+  display: block;
+  box-shadow:
+    0 16px 60px rgba(0,0,0,0.7),
+    0 4px 20px rgba(0,0,0,0.5);
+  transition: opacity 0.4s ease;
+}
+
+/* Canvas lyric line over artwork */
+.fsp-canvas-lyric {
+  font-size: 26px;
+  font-weight: 800;
+  color: white;
+  line-height: 1.2;
+  max-width: 340px;
+  margin-bottom: 16px;
+  text-shadow: 0 2px 16px rgba(0,0,0,0.6);
+  letter-spacing: -0.5px;
+}
+
+/* Large album artwork */
+.fsp-artwork-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px 0;
+  min-height: 0;
+}
+.fsp-artwork {
+  width: min(72vw, 300px);
+  height: min(72vw, 300px);
+  border-radius: 16px;
+  object-fit: cover;
+  box-shadow: 0 32px 80px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.06);
+  transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1);
+}
+.fsp-artwork:hover { transform: scale(1.02); }
+
+/* Song row */
+.fsp-song-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.fsp-mini-cover {
+  width: 56px;
+  height: 56px;
+  border-radius: 8px;
+  object-fit: cover;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  flex-shrink: 0;
+}
+.fsp-song-text { flex: 1; overflow: hidden; }
+.fsp-song-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: white;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fsp-song-artist {
+  font-size: 14px;
+  color: rgba(255,255,255,0.65);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fsp-action-btn {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.6);
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 50%;
+  transition: color 0.2s, transform 0.15s;
+}
+.fsp-action-btn:hover { transform: scale(1.15); }
+.fsp-action-btn.liked { color: #1db954; }
+
+/* Progress */
+.fsp-progress-area { margin-bottom: 20px; }
+.fsp-progress-bg {
+  width: 100%;
+  height: 4px;
+  background: rgba(255,255,255,0.25);
+  border-radius: 2px;
+  cursor: pointer;
+  position: relative;
+}
+.fsp-progress-bg:hover { height: 6px; transition: height 0.15s; }
+.fsp-progress-fill {
+  height: 100%;
+  background: white;
+  border-radius: 2px;
+  position: relative;
+  transition: width 0.1s linear;
+}
+.fsp-progress-thumb {
+  position: absolute;
+  right: -6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  background: white;
+  border-radius: 50%;
+  box-shadow: 0 0 6px rgba(0,0,0,0.4);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.fsp-progress-bg:hover .fsp-progress-thumb { opacity: 1; }
+.fsp-progress-times {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+  font-size: 12px;
+  color: rgba(255,255,255,0.55);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Controls */
+.fsp-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+.fsp-ctrl-btn {
+  background: none;
+  border: none;
+  color: white;
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 50%;
+  transition: opacity 0.2s, transform 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.fsp-ctrl-btn:hover { opacity: 0.75; transform: scale(1.1); }
+.fsp-ctrl-skip { opacity: 0.9; }
+.fsp-play-btn {
+  background: white;
+  color: black;
+  border: none;
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  transition: transform 0.15s;
+}
+.fsp-play-btn:hover { transform: scale(1.05); }
+.fsp-play-btn:active { transform: scale(0.96); }
+
+/* Bottom action row (Lyrics / Sleep / Add) */
+.fsp-bottom-row {
+  display: flex;
+  gap: 10px;
+}
+.fsp-text-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: rgba(255,255,255,0.12);
+  border: none;
+  color: rgba(255,255,255,0.7);
+  padding: 10px 8px;
+  border-radius: 24px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.fsp-text-btn:hover { background: rgba(255,255,255,0.2); color: white; }
+.fsp-text-btn.active { color: #1db954; border: 1px solid rgba(29,185,84,0.5); background: rgba(29,185,84,0.12); }
+
+/* ── Cards below hero ── */
+.fsp-card {
+  margin: 12px 16px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 16px;
+  padding: 20px;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+.fsp-card-header { margin-bottom: 16px; }
+.fsp-card-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: white;
+}
+
+/* Lyrics preview card */
+.fsp-lyrics-card {
+  background: rgba(20, 60, 70, 0.5);
+  border-color: rgba(255,255,255,0.06);
+}
+.fsp-lyrics-preview { margin-bottom: 20px; }
+.fsp-preview-line {
+  font-size: 22px;
+  font-weight: 700;
+  color: rgba(255,255,255,0.4);
+  line-height: 1.35;
+  margin-bottom: 12px;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+.fsp-preview-line.active { color: white; }
+.fsp-preview-line:hover { color: rgba(255,255,255,0.7); }
+.fsp-show-lyrics-btn {
+  background: white;
+  color: black;
+  border: none;
+  padding: 10px 22px;
+  border-radius: 24px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.15s, opacity 0.2s;
+}
+.fsp-show-lyrics-btn:hover { opacity: 0.88; }
+
+/* Explore grid */
+.fsp-explore-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.fsp-explore-item {
+  border-radius: 10px;
+  overflow: hidden;
+  position: relative;
+  aspect-ratio: 1;
+  cursor: pointer;
+}
+.fsp-explore-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.fsp-explore-label {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top, rgba(0,0,0,0.75) 0%, transparent 60%);
+  display: flex;
+  align-items: flex-end;
+  padding: 10px 8px;
+  font-size: 12px;
+  font-weight: 700;
+  color: white;
+  line-height: 1.2;
+}
+
+/* Explore header "See all" button */
+.fsp-card-header-btn {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.fsp-card-header-btn:hover .fsp-card-title { color: rgba(255,255,255,0.7); }
+.fsp-card-see-all {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255,255,255,0.5);
+  transition: color 0.2s;
+}
+.fsp-card-header-btn:hover .fsp-card-see-all { color: white; }
+
+/* Artist songs overlay (reuses lyrics overlay styles) */
+.fsp-artist-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  background: rgba(10,10,15,0.96);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  display: flex;
+  flex-direction: column;
+}
+
+/* Artist song row */
+.fsp-artist-song-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 4px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.2s;
+  margin-bottom: 4px;
+}
+.fsp-artist-song-row:hover { background: rgba(255,255,255,0.07); }
+.fsp-artist-song-cover {
+  width: 52px;
+  height: 52px;
+  border-radius: 8px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+.fsp-artist-song-info { flex: 1; overflow: hidden; }
+.fsp-artist-song-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: white;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fsp-artist-song-artist {
+  font-size: 13px;
+  color: rgba(255,255,255,0.5);
+  margin-top: 2px;
+}
+.fsp-artist-song-play {
+  color: rgba(255,255,255,0.3);
+  flex-shrink: 0;
+  transition: color 0.2s;
+}
+.fsp-artist-song-row:hover .fsp-artist-song-play { color: white; }
+
+/* ── Full Lyrics Overlay ── */
+.fsp-lyrics-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  background: rgba(0,0,0,0.92);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  display: flex;
+  flex-direction: column;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+}
+.fsp-lyrics-overlay.show {
+  opacity: 1;
+  pointer-events: auto;
+}
+.fsp-lyrics-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 52px 20px 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+.fsp-lyrics-header-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: white;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-right: 12px;
+}
+.fsp-lyrics-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px 28px 60px;
+  scroll-behavior: smooth;
+}
+.fsp-lyric-line {
+  font-size: 26px;
+  font-weight: 800;
+  color: rgba(255,255,255,0.28);
+  margin-bottom: 28px;
+  line-height: 1.25;
+  cursor: pointer;
+  transition: color 0.25s, transform 0.25s;
+  letter-spacing: -0.3px;
+}
+.fsp-lyric-line:hover { color: rgba(255,255,255,0.6); }
+.fsp-lyric-line.active {
+  color: white;
+  transform: scale(1.03);
+  transform-origin: left center;
+}
+.fsp-lyric-plain {
+  font-size: 20px;
+  color: white;
+  white-space: pre-wrap;
+  text-align: center;
+  line-height: 1.7;
+}
+
+/* ── Sleep Timer Modal ── */
+.fsp-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 24px;
+}
+.fsp-modal {
+  background: #1a1a2e;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 24px;
+  padding: 24px;
+  width: calc(100% - 32px);
+  max-width: 480px;
+  animation: slideUpModal 0.3s cubic-bezier(0.25, 1, 0.5, 1);
+}
+@keyframes slideUpModal {
+  from { transform: translateY(40px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+.fsp-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.fsp-modal-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: white;
+}
+.fsp-modal-sub {
+  font-size: 13px;
+  color: rgba(255,255,255,0.5);
+  margin: 0 0 20px;
+}
+.fsp-sleep-options {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.fsp-sleep-option {
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.12);
+  color: white;
+  padding: 14px 8px;
+  border-radius: 14px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.fsp-sleep-option:hover {
+  background: rgba(29,185,84,0.2);
+  border-color: #1db954;
+  color: #1db954;
+}
+
+/* ── Options Bottom Sheet ── */
+.fsp-options-sheet {
+  background: #111118;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 24px 24px 0 0;
+  padding: 12px 0 32px;
+  width: 100%;
+  max-width: 540px;
+  animation: slideUpModal 0.3s cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+/* Song identity header */
+.fsp-options-song-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 20px 20px;
+}
+.fsp-options-cover {
+  width: 52px;
+  height: 52px;
+  border-radius: 8px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+.fsp-options-song-info { overflow: hidden; }
+.fsp-options-song-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: white;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fsp-options-song-artist {
+  font-size: 13px;
+  color: rgba(255,255,255,0.5);
+  margin-top: 2px;
+}
+.fsp-options-divider {
+  height: 1px;
+  background: rgba(255,255,255,0.08);
+  margin: 0 0 8px;
+}
+
+/* Option rows */
+.fsp-option-item {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  width: 100%;
+  background: none;
+  border: none;
+  color: white;
+  padding: 16px 24px;
+  font-size: 15px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s;
+}
+.fsp-option-item:hover { background: rgba(255,255,255,0.06); }
+.fsp-option-icon {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: rgba(255,255,255,0.7);
+}
+
+/* Cancel button */
+.fsp-options-cancel {
+  display: block;
+  width: calc(100% - 40px);
+  margin: 16px 20px 0;
+  padding: 16px;
+  background: rgba(255,255,255,0.08);
+  border: none;
+  border-radius: 14px;
+  color: white;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.fsp-options-cancel:hover { background: rgba(255,255,255,0.15); }
+
+/* Copy / action toast */
+.fsp-toast {
+  position: absolute;
+  bottom: 120px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(29, 185, 84, 0.9);
+  color: white;
+  padding: 12px 24px;
+  border-radius: 24px;
+  font-size: 14px;
+  font-weight: 600;
+  z-index: 30;
+  white-space: nowrap;
+  animation: toastIn 0.25s ease, toastOut 0.3s ease 1.7s forwards;
+  pointer-events: none;
+}
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(-50%) translateY(12px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+@keyframes toastOut {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}

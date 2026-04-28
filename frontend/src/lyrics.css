@@ -1,0 +1,90 @@
+/* Lyrics Overlay */
+.lyrics-overlay {
+  position: absolute;
+  top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.88);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+  /* No overflow here — children handle scrolling */
+}
+.lyrics-overlay.show {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Sticky header bar — never scrolls away */
+.lyrics-overlay-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 20px 16px 24px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+.lyrics-overlay-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: white;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Scrollable lyric lines area */
+.lyrics-scroll-area {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px 40px 60px 40px;
+  scroll-behavior: smooth;
+}
+.lyric-line {
+  font-size: 28px;
+  font-weight: 700;
+  color: rgba(255,255,255,0.3);
+  margin-bottom: 24px;
+  transition: color 0.3s ease, transform 0.3s ease;
+  text-align: center;
+  cursor: pointer;
+}
+.lyric-line:hover {
+  color: rgba(255,255,255,0.6);
+}
+.lyric-line.active {
+  color: white;
+  transform: scale(1.05);
+  text-shadow: 0 0 20px rgba(255,255,255,0.3);
+}
+.lyrics-close {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: white;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  cursor: pointer;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.lyrics-close:hover {
+  background: rgba(255, 255, 255, 0.25);
+  transform: scale(1.08);
+}
+@media (max-width: 768px) {
+  .lyric-line { font-size: 22px; margin-bottom: 16px; }
+  .lyrics-overlay { padding: 60px 20px 20px 20px; }
+}
