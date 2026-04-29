@@ -1,5 +1,21 @@
 {
   "appId": "com.tunepirate.app",
-  "appName": "tune-pirate",
-  "webDir": "dist"
+  "appName": "Tune Pirate",
+  "webDir": "dist",
+  "android": {
+    "backgroundColor": "#000000",
+    "allowMixedContent": true,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": false
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchAutoHide": true,
+      "androidScaleType": "CENTER_CROP",
+      "splashFullScreen": true,
+      "splashImmersive": true,
+      "backgroundColor": "#000000",
+      "launchShowDuration": 1500
+    }
+  }
 }

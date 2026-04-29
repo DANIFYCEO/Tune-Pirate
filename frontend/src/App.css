@@ -835,6 +835,8 @@
 .track-list-info {
   flex: 1;
   overflow: hidden;
+  min-width: 0;
+  margin-right: 12px;
 }
 .track-list-title {
   font-size: 16px;
@@ -857,6 +859,8 @@
   gap: 8px;
   padding: 8px;
   color: var(--text-secondary);
+  flex-shrink: 0;
+  margin-left: auto;
 }
 .track-list-actions:hover {
   color: white;

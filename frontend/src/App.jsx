@@ -15,6 +15,7 @@ import CompactPlaylistCard from './components/CompactPlaylistCard';
 import FullScreenPlayer from './components/FullScreenPlayer';
 import './components/FullScreenPlayer.css';
 import SplashScreen from './components/SplashScreen';
+import { App as CapApp } from '@capacitor/app';
 
 const Icons = {
   Home:     () => <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>,
@@ -161,6 +162,24 @@ export default function App() {
     if (isPlayerExpanded && (offlineCover || currentSong?.cover)) bg.style.backgroundImage = `url(${offlineCover || currentSong.cover})`;
     else if (homeBgImages.length) bg.style.backgroundImage = `url(${homeBgImages[bgIndex]})`;
   }, [isPlayerExpanded, currentSong, bgIndex, homeBgImages, offlineCover]);
+
+  // ── Android Back Button Handler ──
+  useEffect(() => {
+    const handler = CapApp.addListener('backButton', () => {
+      if (isPlayerExpanded) {
+        setIsPlayerExpanded(false);
+      } else if (showLyrics) {
+        setShowLyrics(false);
+      } else if (activePlaylist) {
+        setActivePlaylist(null);
+      } else if (activeNav !== 'home') {
+        setActiveNav('home');
+        setSearchQuery('');
+      }
+      // If already on home with nothing open, do nothing (don't exit app)
+    });
+    return () => { handler.then(h => h.remove()); };
+  }, [isPlayerExpanded, showLyrics, activePlaylist, activeNav]);
 
   // Fetch Lyrics logic moved to loadSong effect
 
