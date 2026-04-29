@@ -32,15 +32,20 @@ jobs:
 
     - name: Sync Capacitor Android
       working-directory: ./frontend
-      run: |
-        npx cap copy android
-        npx cap update android
+      run: npx cap sync android
 
     - name: Setup Java
       uses: actions/setup-java@v3
       with:
         distribution: 'zulu'
         java-version: '17'
+
+    - name: Make gradlew executable
+      working-directory: ./frontend/android
+      run: chmod +x gradlew
+
+    - name: Accept Android SDK Licenses
+      run: yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
     - name: Build APK
       working-directory: ./frontend/android
