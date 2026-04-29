@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">tune-pirate</string>
-    <string name="title_activity_main">tune-pirate</string>
+    <string name="app_name">Tune Pirate</string>
+    <string name="title_activity_main">Tune Pirate</string>
     <string name="package_name">com.tunepirate.app</string>
     <string name="custom_url_scheme">com.tunepirate.app</string>
 </resources>
