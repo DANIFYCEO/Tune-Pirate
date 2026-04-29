@@ -38,6 +38,12 @@ jobs:
         cp -r dist/. android/app/src/main/assets/public/
         cp capacitor.config.json android/app/src/main/assets/
 
+    - name: Create missing Capacitor Cordova Gradle file
+      working-directory: ./frontend/android
+      run: |
+        mkdir -p capacitor-cordova-android-plugins
+        echo 'ext { cdvMinSdkVersion = null }' > capacitor-cordova-android-plugins/cordova.variables.gradle
+
     - name: Setup Java
       uses: actions/setup-java@v3
       with:
