@@ -30,9 +30,13 @@ jobs:
       env:
         VITE_API_URL: https://tune-pirate.onrender.com
 
-    - name: Sync Capacitor Android
+    - name: Copy web assets into Android project
       working-directory: ./frontend
-      run: npx cap sync android
+      run: |
+        rm -rf android/app/src/main/assets/public
+        mkdir -p android/app/src/main/assets/public
+        cp -r dist/. android/app/src/main/assets/public/
+        cp capacitor.config.json android/app/src/main/assets/
 
     - name: Setup Java
       uses: actions/setup-java@v3
@@ -49,10 +53,11 @@ jobs:
 
     - name: Build APK
       working-directory: ./frontend/android
-      run: ./gradlew assembleDebug
+      run: ./gradlew assembleDebug --no-daemon
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
       with:
         name: tune-pirate-apk
         path: frontend/android/app/build/outputs/apk/debug/app-debug.apk
+
