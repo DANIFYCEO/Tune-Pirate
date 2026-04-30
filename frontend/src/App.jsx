@@ -161,6 +161,8 @@ export default function App() {
     if (!bg) return;
     if (isPlayerExpanded && (offlineCover || currentSong?.cover)) bg.style.backgroundImage = `url(${offlineCover || currentSong.cover})`;
     else if (homeBgImages.length) bg.style.backgroundImage = `url(${homeBgImages[bgIndex]})`;
+  }, [isPlayerExpanded, currentSong, bgIndex, homeBgImages, offlineCover]);
+
   // Use refs for back button state so we only register the listener once
   const backStateRef = useRef({ isPlayerExpanded, showLyrics, activePlaylist, activeNav });
   useEffect(() => {
