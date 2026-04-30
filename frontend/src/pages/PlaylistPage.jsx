@@ -41,7 +41,7 @@ export default function PlaylistPage({
   useEffect(() => {
     if (playlist && (!playlist.songs || playlist.songs.length === 0) && playlist.id) {
       setIsLoadingSongs(true);
-      fetch(`${import.meta.env.VITE_API_URL}/api/playlist/${playlist.id}`)
+      fetch(`${import.meta.env.VITE_API_URL}/api/playlist/${playlist.id}?title=${encodeURIComponent(playlist.title || '')}`)
         .then(r => r.json())
         .then(data => {
           setFetchedSongs(data.songs || []);

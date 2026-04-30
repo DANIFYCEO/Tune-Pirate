@@ -296,9 +296,10 @@ async def get_spotify_playlists():
 
 # ─── Playlist Details ──────────────────────────────────────────────────────────
 @app.get("/api/playlist/{browse_id}")
-async def get_playlist(browse_id: str):
+async def get_playlist(browse_id: str, title: str = ""):
     try:
-        playlist = yt.get_playlist(browse_id)
+        clean_id = browse_id.replace("VLPL", "PL") if browse_id.startswith("VLPL") else browse_id
+        playlist = yt.get_playlist(clean_id)
         songs = []
         for track in playlist.get('tracks', []):
             vid = track.get('videoId')
@@ -319,10 +320,21 @@ async def get_playlist(browse_id: str):
                 "cover": cover,
                 "youtubeId": vid
             })
-        return {"songs": songs}
+        if songs:
+            return {"songs": songs}
     except Exception as e:
         print(f"Playlist details error for {browse_id}:", e)
-        return {"songs": []}
+    
+    # Fallback: if playlist fails (e.g. private or community playlist bug), search by title!
+    if title:
+        try:
+            fallback_songs = search_songs(title + " playlist", 20)
+            if fallback_songs:
+                return {"songs": fallback_songs}
+        except Exception as e:
+            print("Fallback search failed:", e)
+
+    return {"songs": []}
 
 # ─── Artist Info ───────────────────────────────────────────────────────────────
 @app.get("/api/artist-info/{artist_name}")
