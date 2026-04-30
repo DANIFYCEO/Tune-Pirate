@@ -151,16 +151,16 @@ async def download_song(video_id: str):
         if not os.path.exists(mp3_filepath):
             raise HTTPException(status_code=500, detail="Failed to create MP3 file")
 
-            # Clean filename for the header
-            safe_title = "".join([c for c in title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
-            filename = f"{safe_title}.mp3"
+        # Clean filename for the header
+        safe_title = "".join([c for c in title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+        filename = f"{safe_title}.mp3"
 
-            return FileResponse(
-                mp3_filepath, 
-                media_type="audio/mpeg", 
-                filename=filename,
-                background=BackgroundTask(remove_file, mp3_filepath)
-            )
+        return FileResponse(
+            mp3_filepath, 
+            media_type="audio/mpeg", 
+            filename=filename,
+            background=BackgroundTask(remove_file, mp3_filepath)
+        )
     except Exception as e:
         print(f"Download error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -293,6 +293,36 @@ async def get_spotify_playlists():
     except Exception as e:
         print("Spotify error:", e)
         return {"playlists": []}
+
+# ─── Playlist Details ──────────────────────────────────────────────────────────
+@app.get("/api/playlist/{browse_id}")
+async def get_playlist(browse_id: str):
+    try:
+        playlist = yt.get_playlist(browse_id)
+        songs = []
+        for track in playlist.get('tracks', []):
+            vid = track.get('videoId')
+            if not vid:
+                continue
+            cover = track['thumbnails'][-1]['url'] if track.get('thumbnails') else ""
+            if cover and "googleusercontent.com" in cover and "=" in cover:
+                cover = cover.split("=")[0] + "=w600-h600-l90-rj"
+            
+            artist_name = "Unknown Artist"
+            if track.get('artists') and len(track['artists']) > 0:
+                artist_name = track['artists'][0].get('name', 'Unknown Artist')
+                
+            songs.append({
+                "id": vid,
+                "title": track.get('title'),
+                "artist": artist_name,
+                "cover": cover,
+                "youtubeId": vid
+            })
+        return {"songs": songs}
+    except Exception as e:
+        print(f"Playlist details error for {browse_id}:", e)
+        return {"songs": []}
 
 # ─── Artist Info ───────────────────────────────────────────────────────────────
 @app.get("/api/artist-info/{artist_name}")

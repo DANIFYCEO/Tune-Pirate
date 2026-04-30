@@ -192,19 +192,25 @@ export default function App() {
 
   // ── Background Audio Support ──
   useEffect(() => {
-    if (window.cordova?.plugins?.backgroundMode) {
-      const bgMode = window.cordova.plugins.backgroundMode;
-      bgMode.setDefaults({
-        title: "Tune Pirate",
-        text: "Playing music...",
-        hidden: false,
-        silent: true
-      });
-      bgMode.enable();
-      bgMode.on('activate', () => {
-        bgMode.disableWebViewOptimizations();
-      });
-    }
+    const onDeviceReady = () => {
+      if (window.cordova && window.cordova.plugins && window.cordova.plugins.backgroundMode) {
+        const bgMode = window.cordova.plugins.backgroundMode;
+        bgMode.setDefaults({
+          title: "Tune Pirate",
+          text: "Playing music...",
+          hidden: false,
+          silent: true
+        });
+        bgMode.enable();
+        bgMode.on('activate', () => {
+          bgMode.disableWebViewOptimizations();
+        });
+      }
+    };
+    document.addEventListener("deviceready", onDeviceReady, false);
+    // Also try calling it directly in case deviceready already fired
+    onDeviceReady();
+    return () => document.removeEventListener("deviceready", onDeviceReady);
   }, []);
 
   // Progress Loop
