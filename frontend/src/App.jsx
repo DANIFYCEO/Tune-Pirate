@@ -169,25 +169,52 @@ export default function App() {
     backStateRef.current = { isPlayerExpanded, showLyrics, activePlaylist, activeNav };
   }, [isPlayerExpanded, showLyrics, activePlaylist, activeNav]);
 
-  // ── Android Back Button Handler ──
+  // ── Bulletproof Android Back Button Handler (popstate) ──
   useEffect(() => {
-    let handlerObj = null;
-    CapApp.addListener('backButton', () => {
+    // Push a dummy state so the browser history is never empty
+    window.history.pushState({ dummy: true }, "");
+
+    const handlePopState = (event) => {
+      // User pressed back!
       const state = backStateRef.current;
+      let handled = false;
+
       if (state.isPlayerExpanded) {
         setIsPlayerExpanded(false);
+        handled = true;
       } else if (state.showLyrics) {
         setShowLyrics(false);
+        handled = true;
       } else if (state.activePlaylist) {
         setActivePlaylist(null);
+        handled = true;
       } else if (state.activeNav !== 'home') {
         setActiveNav('home');
         setSearchQuery('');
+        handled = true;
+      }
+
+      if (handled) {
+        // We handled it, so push the dummy state AGAIN to trap the NEXT back button press
+        window.history.pushState({ dummy: true }, "");
       } else {
+        // If we are on the home screen with nothing open, let it exit
         CapApp.exitApp();
       }
+    };
+
+    window.addEventListener("popstate", handlePopState);
+
+    // Also keep Capacitor listener as a fallback
+    let handlerObj = null;
+    CapApp.addListener('backButton', () => {
+      handlePopState();
     }).then(h => { handlerObj = h; });
-    return () => { if (handlerObj) handlerObj.remove(); };
+
+    return () => { 
+      window.removeEventListener("popstate", handlePopState);
+      if (handlerObj) handlerObj.remove(); 
+    };
   }, []);
 
   // ── Background Audio Support ──

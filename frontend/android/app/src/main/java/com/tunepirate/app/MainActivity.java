@@ -15,9 +15,11 @@ public class MainActivity extends BridgeActivity {
     public void onPause() {
         super.onPause();
         // Keep WebView audio playing in background
-        WebView webView = getBridge().getWebView();
+        WebView webView = this.bridge.getWebView();
         if (webView != null) {
-            // Don't pause timers - keeps JS running for audio
+            // Force resume right after Capacitor pauses it
+            webView.onResume();
+            webView.resumeTimers();
         }
     }
 
