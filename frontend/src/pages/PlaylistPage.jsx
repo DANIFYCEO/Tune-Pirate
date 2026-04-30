@@ -35,11 +35,32 @@ export default function PlaylistPage({
     return () => el.removeEventListener('scroll', handleScroll);
   }, []);
 
+  const [fetchedSongs, setFetchedSongs] = useState(null);
+  const [isLoadingSongs, setIsLoadingSongs] = useState(false);
+
+  useEffect(() => {
+    if (playlist && (!playlist.songs || playlist.songs.length === 0) && playlist.id) {
+      setIsLoadingSongs(true);
+      fetch(`${import.meta.env.VITE_API_URL}/api/playlist/${playlist.id}`)
+        .then(r => r.json())
+        .then(data => {
+          setFetchedSongs(data.songs || []);
+        })
+        .catch(err => {
+          console.error("Failed to fetch playlist songs", err);
+          setFetchedSongs([]);
+        })
+        .finally(() => setIsLoadingSongs(false));
+    }
+  }, [playlist]);
+
+  const activeSongs = playlist?.songs?.length > 0 ? playlist.songs : (fetchedSongs || []);
+
   const { startDownload, downloads } = useDownload();
   const isDownloadingPlaylist = isDownloading || downloads.some(d => playlist.songs?.some(s => s.id === d.id));
 
   const downloadPlaylist = async () => {
-    if (!playlist.songs || playlist.songs.length === 0) return;
+    if (!activeSongs || activeSongs.length === 0) return;
     setIsDownloading(true);
     
     // Auto-save playlist to library if not already saved
@@ -48,10 +69,10 @@ export default function PlaylistPage({
     }
     
     let cancelled = false;
-    for (let i = 0; i < playlist.songs.length; i++) {
+    for (let i = 0; i < activeSongs.length; i++) {
       if (cancelled) break;
-      const song = playlist.songs[i];
-      setDownloadProgress(`Downloading ${i + 1}/${playlist.songs.length}`);
+      const song = activeSongs[i];
+      setDownloadProgress(`Downloading ${i + 1}/${activeSongs.length}`);
       try {
         await startDownload(song);
       } catch (e) {
@@ -76,7 +97,7 @@ export default function PlaylistPage({
         <h2 className="sticky-title">{playlist.title}</h2>
         <button 
           className="sticky-play-btn" 
-          onClick={() => playlist.songs?.length > 0 && onSelectSong(playlist.songs[0], playlist.songs)}
+          onClick={() => activeSongs.length > 0 && onSelectSong(activeSongs[0], activeSongs)}
         >
           <Icons.Play />
         </button>
@@ -99,7 +120,7 @@ export default function PlaylistPage({
             <span className="playlist-type">Playlist</span>
             <h1 className="playlist-title-massive">{playlist.title}</h1>
             <p className="playlist-description">{playlist.description}</p>
-            <p className="playlist-meta">Tune Pirate • {playlist.songs?.length || 0} songs</p>
+            <p className="playlist-meta">Tune Pirate • {activeSongs.length || 0} songs</p>
           </div>
         </div>
       </div>
@@ -108,7 +129,7 @@ export default function PlaylistPage({
       <div className="playlist-actions-bar" style={{ display: 'flex', alignItems: 'center', gap: '24px', padding: '16px 24px' }}>
         <button 
           className="btn-play-massive"
-          onClick={() => playlist.songs?.length > 0 && onSelectSong(playlist.songs[0], playlist.songs)}
+          onClick={() => activeSongs.length > 0 && onSelectSong(activeSongs[0], activeSongs)}
         >
           <Icons.Play />
         </button>
@@ -145,16 +166,20 @@ export default function PlaylistPage({
 
       {/* Tracklist */}
       <div className="playlist-tracks">
-        {playlist.songs?.map((song, index) => (
-          <TrackListItem
-            key={`pl-${song.id}-${index}`}
-            song={song}
-            index={index}
-            isActive={currentSong?.id === song.id}
-            onClick={() => onSelectSong(song, playlist.songs)}
-            onRemove={onRemoveSong ? () => onRemoveSong(song) : undefined}
-          />
-        ))}
+        {isLoadingSongs ? (
+          <div style={{ color: 'white', padding: 24, textAlign: 'center' }}>Loading songs...</div>
+        ) : (
+          activeSongs.map((song, index) => (
+            <TrackListItem
+              key={`pl-${song.id}-${index}`}
+              song={song}
+              index={index}
+              isActive={currentSong?.id === song.id}
+              onClick={() => onSelectSong(song, activeSongs)}
+              onRemove={onRemoveSong ? () => onRemoveSong(song) : undefined}
+            />
+          ))
+        )}
       </div>
     </div>
   );

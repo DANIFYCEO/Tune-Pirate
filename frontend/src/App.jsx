@@ -161,27 +161,49 @@ export default function App() {
     if (!bg) return;
     if (isPlayerExpanded && (offlineCover || currentSong?.cover)) bg.style.backgroundImage = `url(${offlineCover || currentSong.cover})`;
     else if (homeBgImages.length) bg.style.backgroundImage = `url(${homeBgImages[bgIndex]})`;
-  }, [isPlayerExpanded, currentSong, bgIndex, homeBgImages, offlineCover]);
+  // Use refs for back button state so we only register the listener once
+  const backStateRef = useRef({ isPlayerExpanded, showLyrics, activePlaylist, activeNav });
+  useEffect(() => {
+    backStateRef.current = { isPlayerExpanded, showLyrics, activePlaylist, activeNav };
+  }, [isPlayerExpanded, showLyrics, activePlaylist, activeNav]);
 
   // ── Android Back Button Handler ──
   useEffect(() => {
-    const handler = CapApp.addListener('backButton', () => {
-      if (isPlayerExpanded) {
+    let handlerObj = null;
+    CapApp.addListener('backButton', () => {
+      const state = backStateRef.current;
+      if (state.isPlayerExpanded) {
         setIsPlayerExpanded(false);
-      } else if (showLyrics) {
+      } else if (state.showLyrics) {
         setShowLyrics(false);
-      } else if (activePlaylist) {
+      } else if (state.activePlaylist) {
         setActivePlaylist(null);
-      } else if (activeNav !== 'home') {
+      } else if (state.activeNav !== 'home') {
         setActiveNav('home');
         setSearchQuery('');
+      } else {
+        CapApp.exitApp();
       }
-      // If already on home with nothing open, do nothing (don't exit app)
-    });
-    return () => { handler.then(h => h.remove()); };
-  }, [isPlayerExpanded, showLyrics, activePlaylist, activeNav]);
+    }).then(h => { handlerObj = h; });
+    return () => { if (handlerObj) handlerObj.remove(); };
+  }, []);
 
-  // Fetch Lyrics logic moved to loadSong effect
+  // ── Background Audio Support ──
+  useEffect(() => {
+    if (window.cordova?.plugins?.backgroundMode) {
+      const bgMode = window.cordova.plugins.backgroundMode;
+      bgMode.setDefaults({
+        title: "Tune Pirate",
+        text: "Playing music...",
+        hidden: false,
+        silent: true
+      });
+      bgMode.enable();
+      bgMode.on('activate', () => {
+        bgMode.disableWebViewOptimizations();
+      });
+    }
+  }, []);
 
   // Progress Loop
   useEffect(() => {

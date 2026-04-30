@@ -10,9 +10,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@awesome-cordova-plugins/background-mode": "^9.1.4",
     "@capacitor/android": "^8.3.1",
     "@capacitor/app": "^8.1.0",
     "@capacitor/core": "^8.3.1",
+    "cordova-plugin-background-mode": "^0.7.3",
+    "cordova-plugin-device": "^3.0.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "react-youtube": "^10.1.0"
