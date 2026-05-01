@@ -372,11 +372,11 @@
   transform: translate(-50%, 150%);
   transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1);
   cursor: pointer;
-  background: var(--surface-elevated);
+  background: rgba(28, 28, 34, 0.92);
   backdrop-filter: blur(60px) saturate(200%);
   -webkit-backdrop-filter: blur(60px) saturate(200%);
-  border: 1px solid rgba(255,255,255,0.08);
-  box-shadow: 0 24px 48px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.1);
+  border: 1px solid rgba(255,255,255,0.14);
+  box-shadow: 0 24px 48px rgba(0,0,0,0.9), inset 0 1px 0 rgba(255,255,255,0.12);
 }
 .desktop-player.visible {
   transform: translate(-50%, 0);
@@ -831,6 +831,7 @@
   height: 48px;
   border-radius: 4px;
   object-fit: cover;
+  flex-shrink: 0;
 }
 .track-list-info {
   flex: 1;
@@ -937,6 +938,7 @@
     border-radius: 36px;
     padding: 0 16px 0 8px;
     transform: translate(-50%, 300%);
+    background: rgba(22, 22, 28, 0.96);
   }
   .desktop-player.visible {
     transform: translate(-50%, 0);

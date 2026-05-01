@@ -218,26 +218,60 @@ export default function App() {
   }, []);
 
   // ── Background Audio Support ──
+  // Keeps the WebView alive when the app is backgrounded so YouTube keeps playing.
+  // Uses a silent looping audio buffer as a "heartbeat" to hold the audio session,
+  // plus cordova-plugin-background-mode to prevent the WebView from being throttled.
+  const silentAudioRef = useRef(null);
+
   useEffect(() => {
+    // Create a silent looping audio context to hold the audio session open
+    const createSilentAudio = () => {
+      try {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) return;
+        const ctx = new AudioContext();
+        const buffer = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.loop = true;
+        source.connect(ctx.destination);
+        source.start(0);
+        silentAudioRef.current = { ctx, source };
+      } catch {}
+    };
+
     const onDeviceReady = () => {
-      if (window.cordova && window.cordova.plugins && window.cordova.plugins.backgroundMode) {
+      // Enable cordova background mode
+      if (window.cordova?.plugins?.backgroundMode) {
         const bgMode = window.cordova.plugins.backgroundMode;
         bgMode.setDefaults({
           title: "Tune Pirate",
-          text: "Playing music...",
+          text: "Music is playing",
           hidden: false,
-          silent: true
+          silent: true,
         });
         bgMode.enable();
         bgMode.on('activate', () => {
           bgMode.disableWebViewOptimizations();
+          // Resume silent audio to keep audio session alive
+          try { silentAudioRef.current?.ctx?.resume(); } catch {}
+        });
+        bgMode.on('deactivate', () => {
+          // App came back to foreground — nothing needed
         });
       }
+      createSilentAudio();
     };
-    document.addEventListener("deviceready", onDeviceReady, false);
-    // Also try calling it directly in case deviceready already fired
+
+    document.addEventListener('deviceready', onDeviceReady, false);
+    // Also call directly in case deviceready already fired (web browser)
     onDeviceReady();
-    return () => document.removeEventListener("deviceready", onDeviceReady);
+
+    return () => {
+      document.removeEventListener('deviceready', onDeviceReady);
+      try { silentAudioRef.current?.source?.stop(); } catch {}
+      try { silentAudioRef.current?.ctx?.close(); } catch {}
+    };
   }, []);
 
   // Progress Loop
@@ -406,6 +440,18 @@ export default function App() {
       } catch (error) {
         console.warn("MediaSession API actions not fully supported.", error);
       }
+
+      // Update cordova background mode notification with current song
+      try {
+        if (window.cordova?.plugins?.backgroundMode) {
+          window.cordova.plugins.backgroundMode.configure({
+            title: currentSong.title,
+            text: currentSong.artist,
+            hidden: false,
+            silent: true,
+          });
+        }
+      } catch {}
     }
   }, [currentSong, offlineCover]);
 

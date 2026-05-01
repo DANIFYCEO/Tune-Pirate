@@ -35,37 +35,52 @@ export function DownloadProvider({ children }) {
           signal: controller.signal
         });
 
-        if (!response.ok) throw new Error('Network response was not ok');
+        if (!response.ok) throw new Error(`Server error: ${response.status}`);
 
-        // To track progress, we need to read the body manually
-        const contentLength = response.headers.get('content-length');
-        const total = parseInt(contentLength, 10);
-        let loaded = 0;
+        let blob;
 
-        const reader = response.body.getReader();
-        const chunks = [];
+        // Try streaming read for progress; fall back to arrayBuffer on Android WebViews that don't support it
+        try {
+          const contentLength = response.headers.get('content-length');
+          const total = parseInt(contentLength, 10);
+          let loaded = 0;
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          loaded += value.length;
-          if (total) {
-            const progress = Math.round((loaded / total) * 100);
-            setDownloads(prev => prev.map(d => d.id === song.id ? { ...d, progress } : d));
-          } else {
-            // Fake progress if no content-length
-            setDownloads(prev => prev.map(d => d.id === song.id ? { ...d, progress: Math.min(d.progress + 10, 95) } : d));
+          const reader = response.body.getReader();
+          const chunks = [];
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            loaded += value.length;
+            if (total) {
+              const progress = Math.round((loaded / total) * 100);
+              setDownloads(prev => prev.map(d => d.id === song.id ? { ...d, progress } : d));
+            } else {
+              setDownloads(prev => prev.map(d => d.id === song.id ? { ...d, progress: Math.min(d.progress + 5, 90) } : d));
+            }
           }
-        }
 
-        const blob = new Blob(chunks, { type: 'audio/mpeg' });
+          blob = new Blob(chunks, { type: 'audio/mpeg' });
+        } catch (streamErr) {
+          if (streamErr.name === 'AbortError') throw streamErr;
+          // Streaming not supported — fall back to arrayBuffer
+          console.warn('Streaming read failed, falling back to arrayBuffer:', streamErr);
+          const fallbackRes = await fetch(`${import.meta.env.VITE_API_URL}/api/download/${videoId}`, {
+            signal: controller.signal
+          });
+          if (!fallbackRes.ok) throw new Error(`Server error: ${fallbackRes.status}`);
+          setDownloads(prev => prev.map(d => d.id === song.id ? { ...d, progress: 50 } : d));
+          const buffer = await fallbackRes.arrayBuffer();
+          blob = new Blob([buffer], { type: 'audio/mpeg' });
+        }
         
-        // Fetch Cover Image
+        // Fetch Cover Image — proxy through backend to avoid CORS on Android
         let coverBlob = null;
         try {
           if (song.cover) {
-            const coverRes = await fetch(song.cover);
+            const coverUrl = `${import.meta.env.VITE_API_URL}/api/proxy-image?url=${encodeURIComponent(song.cover)}`;
+            const coverRes = await fetch(coverUrl);
             if (coverRes.ok) coverBlob = await coverRes.blob();
           }
         } catch (e) { console.warn("Failed to fetch cover for offline:", e); }

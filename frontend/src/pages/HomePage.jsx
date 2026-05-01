@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react';
 import TrackCard from '../components/TrackCard';
 import CompactPlaylistCard from '../components/CompactPlaylistCard';
 
+const FALLBACK = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Crect width='300' height='300' fill='%23222'/%3E%3Ccircle cx='150' cy='150' r='60' fill='%23444'/%3E%3Ccircle cx='150' cy='150' r='20' fill='%23222'/%3E%3C/svg%3E";
+
 function SectionRow({ title, songs, onSelect, currentSong, isLoading }) {
   if (isLoading) return (
     <div style={{ marginBottom: 48 }}>
@@ -214,11 +216,28 @@ export default function HomePage({ onSelectSong, onSelectPlaylist, currentSong, 
           <div className="section-header"><span>Check These Out</span></div>
           <div className="grid-horizontal">
             {checkTheseOut.map(pl => (
-              <CompactPlaylistCard
+              <div
                 key={pl.browseId || pl.title}
-                playlist={{ id: pl.browseId, ...pl }}
+                className="track-card"
                 onClick={() => onSelectPlaylist({ id: pl.browseId, ...pl })}
-              />
+              >
+                <div className="track-cover-container">
+                  <img
+                    src={pl.cover || FALLBACK}
+                    alt={pl.title}
+                    className="track-cover"
+                    referrerPolicy="no-referrer"
+                    onError={e => { e.target.onerror = null; e.target.src = FALLBACK; }}
+                  />
+                  <div className="play-overlay">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                  </div>
+                </div>
+                <div className="track-info">
+                  <div className="track-name">{pl.title}</div>
+                  <div className="track-artist">{pl.author || 'Playlist'}</div>
+                </div>
+              </div>
             ))}
           </div>
         </div>
@@ -230,11 +249,28 @@ export default function HomePage({ onSelectSong, onSelectPlaylist, currentSong, 
           <div className="section-header"><span>Spotify Curated</span></div>
           <div className="grid-horizontal">
             {spotifyPlaylists.map(pl => (
-              <CompactPlaylistCard
+              <div
                 key={pl.browseId || pl.title}
-                playlist={{ id: pl.browseId, ...pl }}
+                className="track-card"
                 onClick={() => onSelectPlaylist({ id: pl.browseId, ...pl })}
-              />
+              >
+                <div className="track-cover-container">
+                  <img
+                    src={pl.cover || FALLBACK}
+                    alt={pl.title}
+                    className="track-cover"
+                    referrerPolicy="no-referrer"
+                    onError={e => { e.target.onerror = null; e.target.src = FALLBACK; }}
+                  />
+                  <div className="play-overlay">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                  </div>
+                </div>
+                <div className="track-info">
+                  <div className="track-name">{pl.title}</div>
+                  <div className="track-artist">{pl.author || 'Playlist'}</div>
+                </div>
+              </div>
             ))}
           </div>
         </div>
@@ -268,7 +304,7 @@ export default function HomePage({ onSelectSong, onSelectPlaylist, currentSong, 
                   alt={mood.label}
                   className="mood-cover"
                   referrerPolicy="no-referrer"
-                  crossOrigin="anonymous"
+                  onError={e => { e.target.onerror = null; e.target.src = FALLBACK; }}
                 />
                 <div className="mood-label">{mood.emoji} {mood.label}</div>
               </div>

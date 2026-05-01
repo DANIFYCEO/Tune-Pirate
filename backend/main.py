@@ -1,15 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from ytmusicapi import YTMusic
 import yt_dlp
 import imageio_ffmpeg
-import subprocess
+import asyncio
 import random
-import re
 import tempfile
 import os
+import httpx
 
 # Resolve bundled ffmpeg binary path once at startup
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
@@ -105,65 +105,71 @@ def remove_file(path: str):
 
 @app.get("/api/download/{video_id}")
 async def download_song(video_id: str):
-    """Downloads the audio of a YouTube video using yt-dlp and returns it as an MP3."""
+    """Extracts a direct audio URL and streams it to the client via ffmpeg pipe."""
     if not video_id:
         raise HTTPException(status_code=400, detail="Missing video_id")
-    
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    temp_dir = tempfile.gettempdir()
-    outtmpl = os.path.join(temp_dir, f"{video_id}_%(title)s.%(ext)s")
 
-    # Download raw audio without yt-dlp's ffmpeg post-processor
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # Step 1: extract the direct audio stream URL (no download)
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': os.path.join(temp_dir, f"{video_id}_raw.%(ext)s"),
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
         'quiet': True,
         'no_warnings': True,
+        'skip_download': True,
     }
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=True)
-            title = info_dict.get('title', 'audio')
-            ext = info_dict.get('ext', 'webm')
-            
-        raw_filepath = os.path.join(temp_dir, f"{video_id}_raw.{ext}")
-        mp3_filepath = os.path.join(temp_dir, f"{video_id}.mp3")
-
-        if os.path.exists(mp3_filepath):
-            os.remove(mp3_filepath)
-
-        # Manually invoke ffmpeg to convert to mp3
-        ffmpeg_cmd = [
-            FFMPEG_PATH,
-            "-y",  # overwrite output
-            "-i", raw_filepath,
-            "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
-            mp3_filepath
-        ]
-        
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        # Cleanup raw file
-        if os.path.exists(raw_filepath):
-            os.remove(raw_filepath)
-            
-        if not os.path.exists(mp3_filepath):
-            raise HTTPException(status_code=500, detail="Failed to create MP3 file")
-
-        # Clean filename for the header
-        safe_title = "".join([c for c in title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
-        filename = f"{safe_title}.mp3"
-
-        return FileResponse(
-            mp3_filepath, 
-            media_type="audio/mpeg", 
-            filename=filename,
-            background=BackgroundTask(remove_file, mp3_filepath)
-        )
+            info = ydl.extract_info(url, download=False)
+            audio_url = info.get('url')
+            title = info.get('title', 'audio')
+            if not audio_url:
+                raise HTTPException(status_code=404, detail="No audio URL found")
     except Exception as e:
-        print(f"Download error: {e}")
+        print(f"yt-dlp extract error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+    # Step 2: stream through ffmpeg → mp3 pipe → client
+    safe_title = "".join([c for c in title if c.isalpha() or c.isdigit() or c == ' ']).strip()
+    filename = f"{safe_title or video_id}.mp3"
+
+    ffmpeg_cmd = [
+        FFMPEG_PATH,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-i", audio_url,
+        "-vn",
+        "-ar", "44100",
+        "-ac", "2",
+        "-b:a", "128k",
+        "-f", "mp3",
+        "pipe:1",
+    ]
+
+    async def stream_audio():
+        proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)  # 64KB chunks
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        stream_audio(),
+        media_type="audio/mpeg",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 # ─── Lyrics endpoint ───────────────────────────────────────────────────────────
 @app.get("/api/lyrics/{video_id}")
@@ -422,3 +428,18 @@ async def get_artist(name: str = ""):
         return {"songs": []}
     songs = search_songs(f"{name} songs", 50)
     return {"artist": name, "songs": songs}
+
+# ─── Image Proxy (avoids CORS issues when downloading cover art on Android) ───
+@app.get("/api/proxy-image")
+async def proxy_image(url: str = ""):
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing url parameter")
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail="Failed to fetch image")
+            content_type = resp.headers.get("content-type", "image/jpeg")
+            return Response(content=resp.content, media_type=content_type)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Image fetch error: {e}")

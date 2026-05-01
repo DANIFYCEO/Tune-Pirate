@@ -29,7 +29,6 @@ export default function TrackCard({ song, isActive, onClick, size = 'md' }) {
           alt={song.title}
           className="track-cover"
           referrerPolicy="no-referrer"
-          crossOrigin="anonymous"
           onError={() => setImgSrc(FALLBACK)}
           style={{ transform: 'translateZ(20px)' }}
         />
