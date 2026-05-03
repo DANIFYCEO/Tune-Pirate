@@ -4,12 +4,13 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from ytmusicapi import YTMusic
 import yt_dlp
-import imageio_ffmpeg
 import asyncio
 import random
-import tempfile
 import os
 import httpx
+
+# Use system ffmpeg (installed via Dockerfile apt-get)
+FFMPEG_PATH = "ffmpeg"
 
 # Resolve bundled ffmpeg binary path once at startup
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
