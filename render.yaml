@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: Tune-Pirate-1
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    envVars:
+      - key: PORT
+        value: 8000
