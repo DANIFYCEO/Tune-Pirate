@@ -248,7 +248,9 @@ export default function App() {
           title: "Tune Pirate",
           text: "Music is playing",
           hidden: false,
-          silent: true,
+          silent: false,
+          resume: true,
+          icon: "ic_launcher",
         });
         bgMode.enable();
         bgMode.on('activate', () => {
@@ -448,7 +450,8 @@ export default function App() {
             title: currentSong.title,
             text: currentSong.artist,
             hidden: false,
-            silent: true,
+            silent: false,
+            resume: true,
           });
         }
       } catch {}

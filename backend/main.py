@@ -104,33 +104,70 @@ def remove_file(path: str):
     except Exception as e:
         print(f"Error removing temp file {path}: {e}")
 
+# Common HTTP headers to avoid bot detection
+YDL_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Referer': 'https://www.youtube.com/',
+}
+
+# Player client strategies to try in order (different clients bypass different blocks)
+YDL_CLIENT_STRATEGIES = [
+    ['web_creator'],
+    ['mweb'],
+    ['web', 'web_creator'],
+    [],  # default
+]
+
+def _extract_audio_url(video_id: str):
+    """Try multiple yt-dlp player client strategies to extract a direct audio URL."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    last_error = None
+
+    for clients in YDL_CLIENT_STRATEGIES:
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'http_headers': YDL_HEADERS,
+            'socket_timeout': 30,
+            'retries': 3,
+            'fragment_retries': 3,
+        }
+        if clients:
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': clients}}
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                audio_url = info.get('url')
+                title = info.get('title', 'audio')
+                duration = info.get('duration', 0)
+                if audio_url:
+                    return audio_url, title, duration
+        except Exception as e:
+            last_error = e
+            print(f"yt-dlp extract failed with clients={clients}: {e}")
+            continue
+
+    raise last_error or Exception("All extraction strategies failed")
+
+
 @app.get("/api/download/{video_id}")
 async def download_song(video_id: str):
     """Extracts a direct audio URL and streams it to the client via ffmpeg pipe."""
     if not video_id:
         raise HTTPException(status_code=400, detail="Missing video_id")
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
-
-    # Step 1: extract the direct audio stream URL (no download)
-    ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-    }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            audio_url = info.get('url')
-            title = info.get('title', 'audio')
-            if not audio_url:
-                raise HTTPException(status_code=404, detail="No audio URL found")
+        audio_url, title, _ = _extract_audio_url(video_id)
     except Exception as e:
-        print(f"yt-dlp extract error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Download extract error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract audio: {e}")
 
-    # Step 2: stream through ffmpeg → mp3 pipe → client
+    # Stream through ffmpeg → mp3 pipe → client (no temp files needed)
     safe_title = "".join([c for c in title if c.isalpha() or c.isdigit() or c == ' ']).strip()
     filename = f"{safe_title or video_id}.mp3"
 
@@ -139,11 +176,12 @@ async def download_song(video_id: str):
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
+        "-headers", f"User-Agent: {YDL_HEADERS['User-Agent']}\r\nReferer: https://www.youtube.com/\r\n",
         "-i", audio_url,
         "-vn",
         "-ar", "44100",
         "-ac", "2",
-        "-b:a", "128k",
+        "-b:a", "192k",
         "-f", "mp3",
         "pipe:1",
     ]

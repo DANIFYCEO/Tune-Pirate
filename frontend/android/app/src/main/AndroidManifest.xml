@@ -16,7 +16,8 @@
             android:label="@string/title_activity_main"
             android:theme="@style/AppTheme.NoActionBarLaunch"
             android:launchMode="singleTask"
-            android:exported="true">
+            android:exported="true"
+            android:persistableMode="persistAcrossReboots">
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -34,6 +35,13 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths"></meta-data>
         </provider>
+
+        <!-- Required for background audio persistence to prevent app from crashing when minimized -->
+        <service
+            android:name="de.appplant.cordova.plugin.background.ForegroundService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback" />
+
     </application>
 
     <!-- Permissions -->
