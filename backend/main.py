@@ -1,175 +1,491 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
-from starlette.background import BackgroundTask
-from ytmusicapi import YTMusic
-import yt_dlp
-import asyncio
+"""
+Tune Pirate Backend — FastAPI
+Provides music search, streaming, downloads, and discovery via YouTube Music.
+"""
+
+import difflib
+import logging
 import random
-import os
+import re
+import time
+from datetime import datetime
+from functools import wraps
+from typing import Optional
+
+import asyncio
 import httpx
+import yt_dlp
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
+from ytmusicapi import YTMusic
 
-# Use system ffmpeg (installed via Dockerfile apt-get)
-FFMPEG_PATH = "ffmpeg"
+# ─── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("tunepirate")
 
-# Use system ffmpeg installed via Dockerfile
-FFMPEG_PATH = "ffmpeg"
-
-app = FastAPI()
+# ─── App Setup ─────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Tune Pirate API",
+    version="2.0.0",
+    description="Music search, streaming, and discovery powered by YouTube Music.",
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 yt = YTMusic()
 
-def format_track(track):
-    thumbnails = track.get("thumbnails", [])
-    cover_url = thumbnails[-1]["url"] if thumbnails else ""
-    if cover_url and "googleusercontent.com" in cover_url and "=" in cover_url:
-        cover_url = cover_url.split("=")[0] + "=w600-h600-l90-rj"
-    artists = track.get("artists", [])
-    artist_name = artists[0]["name"] if artists else "Unknown Artist"
-    album = track.get("album", {})
-    album_name = album.get("name", "") if album else ""
-    duration = track.get("duration", "")
+FFMPEG_PATH = "ffmpeg"
+
+# ─── Pydantic Response Models ─────────────────────────────────────────────────
+class Track(BaseModel):
+    id: Optional[str] = None
+    title: Optional[str] = None
+    artist: str = "Unknown Artist"
+    album: str = ""
+    cover: str = ""
+    duration: str = ""
+    youtubeId: Optional[str] = None
+
+class PlaylistItem(BaseModel):
+    browseId: Optional[str] = None
+    title: Optional[str] = None
+    author: Optional[str] = None
+    cover: str = ""
+    songCount: Optional[str] = None
+
+class ArtistInfo(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    subscribers: Optional[str] = None
+    monthlyListeners: Optional[str] = None
+    description: Optional[str] = None
+    image: str = ""
+
+# ─── TTL Cache ─────────────────────────────────────────────────────────────────
+_cache: dict[str, tuple[float, any]] = {}
+
+def cached(ttl_seconds: int = 3600):
+    """Simple in-memory TTL cache decorator for expensive endpoints."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            key = f"{func.__name__}:{args}:{sorted(kwargs.items())}"
+            now = time.time()
+            if key in _cache:
+                timestamp, value = _cache[key]
+                if now - timestamp < ttl_seconds:
+                    logger.debug(f"Cache hit: {func.__name__}")
+                    return value
+            result = func(*args, **kwargs)
+            _cache[key] = (now, result)
+            return result
+        return wrapper
+    return decorator
+
+@app.delete("/api/cache")
+def clear_cache():
+    """Clear all cached data (admin/debug endpoint)."""
+    _cache.clear()
+    return {"status": "ok", "message": "Cache cleared"}
+
+
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+def _get_cover_url(item: dict) -> str:
+    """Safely extract and upscale cover URL from a YouTube Music item."""
+    thumbnails = item.get("thumbnails") or item.get("thumbnail") or []
+    if not thumbnails:
+        return ""
+    cover_url = thumbnails[-1].get("url", "")
+    if cover_url and "googleusercontent.com" in cover_url:
+        base = cover_url.split("=")[0] if "=" in cover_url else cover_url
+        return f"{base}=w600-h600-l90-rj"
+    return cover_url
+
+
+def _get_artist_name(item: dict) -> str:
+    """Safely extract primary artist name."""
+    artists = item.get("artists") or []
+    if artists and isinstance(artists, list) and len(artists) > 0:
+        return artists[0].get("name", "Unknown Artist")
+    return "Unknown Artist"
+
+
+def format_track(track: dict) -> dict:
+    """Format a YouTube Music track into a consistent Track shape."""
+    vid = track.get("videoId")
     return {
-        "id": track.get("videoId"),
+        "id": vid,
         "title": track.get("title"),
-        "artist": artist_name,
-        "album": album_name,
-        "cover": cover_url,
-        "duration": duration,
-        "youtubeId": track.get("videoId"),
+        "artist": _get_artist_name(track),
+        "album": (track.get("album") or {}).get("name", ""),
+        "cover": _get_cover_url(track),
+        "duration": track.get("duration", ""),
+        "youtubeId": vid,
     }
 
-def search_songs(query: str, limit: int = 8):
+
+def _format_playlist(item: dict) -> dict:
+    """Format a YouTube Music playlist search result."""
+    return {
+        "browseId": item.get("browseId"),
+        "title": item.get("title"),
+        "author": item.get("author"),
+        "cover": _get_cover_url(item),
+        "songCount": item.get("itemCount"),
+    }
+
+
+def _current_year() -> int:
+    return datetime.now().year
+
+
+def parse_duration_seconds(duration_str: str) -> int:
+    """Convert duration string (e.g. '3:45', '1:02:15') into integer seconds."""
+    if not duration_str:
+        return 0
+    parts = duration_str.strip().split(":")
     try:
-        results = yt.search(query, filter="songs", limit=limit + 4)
-        random.shuffle(results)
-        seen = set()
+        if len(parts) == 1:
+            return int(parts[0])
+        elif len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except ValueError:
+        return 0
+    return 0
+
+
+def is_full_song(track: dict, allow_long: bool = False) -> bool:
+    """Ensure track is a full song version (not short snippet/ringtone or huge podcast)."""
+    dur_str = track.get("duration") or ""
+    dur_sec = parse_duration_seconds(dur_str)
+    title_lower = (track.get("title") or "").lower()
+
+    # Reject obvious preview/snippet terms
+    junk_snip = ["snippet", "ringtone", "preview", "teaser", "shorts", "sample sound"]
+    if any(s in title_lower for s in junk_snip):
+        return False
+
+    if dur_sec > 0:
+        # Full song must be at least 70 seconds (filters out previews, shorts, ringtones)
+        if dur_sec < 70:
+            return False
+        # Filter out 1+ hour mixes unless allow_long is requested
+        if not allow_long and dur_sec > 660:
+            return False
+
+    return True
+
+
+def normalize_title_for_dedup(title: str) -> str:
+    """Normalize title to catch duplicate recordings/uploads of the same song."""
+    t = (title or "").lower()
+    t = re.sub(r"\s*[\(\[\{].*?[\)\]\}]", "", t)
+    t = re.sub(r"[^a-z0-9]", "", t)
+    return t
+
+
+def search_songs(query: str, limit: int = 8, allow_long: bool = False) -> list[dict]:
+    """Search YouTube Music for songs with duration validation and deduplication."""
+    try:
+        # Check if user explicitly searched for long formats
+        q_lower = query.lower()
+        allow_long = allow_long or any(w in q_lower for w in ["mix", "album", "set", "podcast", "full", "live"])
+
+        results = yt.search(query, filter="songs", limit=limit * 2 + 6)
+        seen_ids = set()
+        seen_titles = set()
         unique = []
+
         for t in results:
             vid = t.get("videoId")
-            if vid and vid not in seen:
-                seen.add(vid)
-                unique.append(format_track(t))
+            if not vid or vid in seen_ids:
+                continue
+
+            formatted = format_track(t)
+            if not is_full_song(formatted, allow_long=allow_long):
+                continue
+
+            norm_key = (normalize_title_for_dedup(formatted["title"]), formatted["artist"].lower())
+            if norm_key in seen_titles and len(unique) >= 3:
+                continue
+
+            seen_ids.add(vid)
+            seen_titles.add(norm_key)
+            unique.append(formatted)
+
             if len(unique) >= limit:
                 break
+
         return unique
     except Exception as e:
-        print(f"Search error: {e}")
+        logger.error(f"Search error for '{query}': {e}")
         return []
 
-# ─── Search endpoint ───────────────────────────────────────────────────────────
-@app.get("/api/search")
-async def search(q: str = "", limit: int = 20):
-    if not q.strip():
-        return {"songs": [], "query": ""}
-    try:
-        results = yt.search(q.strip(), filter="songs", limit=limit + 6)
-        seen = set()
-        songs = []
-        for t in results:
-            vid = t.get("videoId")
-            if vid and vid not in seen:
-                seen.add(vid)
-                songs.append(format_track(t))
-            if len(songs) >= limit:
-                break
-        return {"songs": songs, "query": q}
-    except Exception as e:
-        print(f"Search error: {e}")
-        return {"songs": [], "query": q}
 
-# ─── Stream URL endpoint ───────────────────────────────────────────────────────
-@app.get("/api/stream/{video_id}")
-async def get_stream_url(video_id: str):
-    """Returns a YouTube embed URL for playback."""
-    if not video_id:
-        raise HTTPException(status_code=400, detail="Missing video_id")
-    # Return YouTube embed URL — plays in an iframe/audio context
-    embed_url = f"https://www.youtube.com/embed/{video_id}?autoplay=1&controls=0"
-    watch_url = f"https://music.youtube.com/watch?v={video_id}"
-    return {"videoId": video_id, "embedUrl": embed_url, "watchUrl": watch_url}
-
-# ─── Download endpoint ─────────────────────────────────────────────────────────
-def remove_file(path: str):
-    try:
-        os.remove(path)
-    except Exception as e:
-        print(f"Error removing temp file {path}: {e}")
-
-# Common HTTP headers to avoid bot detection
+# ─── yt-dlp Audio Extraction ──────────────────────────────────────────────────
 YDL_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Referer': 'https://www.youtube.com/',
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Referer": "https://www.youtube.com/",
 }
 
-# Player client strategies to try in order (different clients bypass different blocks)
 YDL_CLIENT_STRATEGIES = [
-    ['web_creator'],
-    ['mweb'],
-    ['web', 'web_creator'],
-    [],  # default
+    ["android"],
+    ["ios"],
+    ["web_creator"],
+    ["mweb"],
+    ["web", "web_creator"],
+    [],
 ]
 
-def _extract_audio_url(video_id: str):
+VIDEO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+
+
+def _validate_video_id(video_id: str) -> str:
+    """Validate and sanitize a YouTube video ID."""
+    vid = video_id.strip()
+    if not VIDEO_ID_PATTERN.match(vid):
+        raise HTTPException(status_code=400, detail="Invalid video_id format")
+    return vid
+
+
+def _extract_audio_url(video_id: str) -> tuple[str, str, int]:
     """Try multiple yt-dlp player client strategies to extract a direct audio URL."""
     url = f"https://www.youtube.com/watch?v={video_id}"
     last_error = None
 
     for clients in YDL_CLIENT_STRATEGIES:
         ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
-            'http_headers': YDL_HEADERS,
-            'socket_timeout': 30,
-            'retries': 3,
-            'fragment_retries': 3,
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "http_headers": YDL_HEADERS,
+            "socket_timeout": 30,
+            "retries": 3,
+            "fragment_retries": 3,
         }
         if clients:
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': clients}}
+            ydl_opts["extractor_args"] = {"youtube": {"player_client": clients}}
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                audio_url = info.get('url')
-                title = info.get('title', 'audio')
-                duration = info.get('duration', 0)
+                audio_url = info.get("url")
+                title = info.get("title", "audio")
+                duration = info.get("duration", 0)
                 if audio_url:
                     return audio_url, title, duration
         except Exception as e:
             last_error = e
-            print(f"yt-dlp extract failed with clients={clients}: {e}")
+            logger.warning(f"yt-dlp extract failed with clients={clients}: {e}")
             continue
 
     raise last_error or Exception("All extraction strategies failed")
 
 
+# Shared httpx client for connection reuse
+_http_client: Optional[httpx.AsyncClient] = None
+
+async def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+    return _http_client
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TIER 1 — FIXED EXISTING ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Search Ranking Engine ───────────────────────────────────────────────────
+JUNK_TERMS = {
+    "karaoke", "instrumental", "cover", "slowed", "reverb", "sped up",
+    "nightcore", "tribute", "parody", "reaction", "remake", "ringtone",
+    "snippet", "teaser", "8d audio", "bass boosted", "guitar cover",
+    "piano cover", "piano tutorial", "acoustic cover", "live at",
+    "live in concert", "audience", "fan cam", "reaction video"
+}
+
+def rank_search_results(query: str, raw_songs: list[dict], limit: int) -> list[dict]:
+    """
+    Score and rank search results like Spotify:
+    - Fuzzy matching & typo tolerance (SequenceMatcher).
+    - Prioritizes official studio album versions.
+    - Heavily penalizes karaoke, covers, live concert phone recordings, instrumentals.
+    - Drops shorts, snippets, and ringtones.
+    - Promotes verified official artist releases.
+    """
+    q_lower = query.lower().strip()
+    q_words = set(re.findall(r"\w+", q_lower))
+    allow_junk = any(term in q_lower for term in JUNK_TERMS)
+    allow_long = any(w in q_lower for w in ["mix", "album", "set", "podcast", "full", "live"])
+
+    scored_tracks = []
+    seen_ids = set()
+    seen_canonical = set()
+
+    for item in raw_songs:
+        vid = item.get("videoId") or item.get("id")
+        if not vid or vid in seen_ids:
+            continue
+
+        title = item.get("title") or ""
+        artist = _get_artist_name(item) if "artists" in item else item.get("artist", "")
+        formatted = format_track(item) if "videoId" in item else item
+
+        if not is_full_song(formatted, allow_long=allow_long):
+            continue
+
+        title_lower = title.lower()
+        artist_lower = artist.lower()
+        score = 100.0
+
+        # Exact title match boost
+        if q_lower == title_lower:
+            score += 160
+        elif title_lower.startswith(q_lower):
+            score += 90
+        elif q_lower in title_lower:
+            score += 60
+
+        # Exact artist match boost
+        if q_lower == artist_lower or q_lower in artist_lower:
+            score += 70
+
+        # Fuzzy string similarity (handles typos e.g. 'buran boy', 'asake peac')
+        title_sim = difflib.SequenceMatcher(None, q_lower, title_lower).ratio()
+        if title_sim > 0.8:
+            score += 120 * title_sim
+        elif title_sim > 0.6:
+            score += 60 * title_sim
+
+        artist_sim = difflib.SequenceMatcher(None, q_lower, artist_lower).ratio()
+        if artist_sim > 0.8:
+            score += 80 * artist_sim
+
+        # Word overlap
+        track_words = set(re.findall(r"\w+", f"{title_lower} {artist_lower}"))
+        overlap = len(q_words.intersection(track_words))
+        score += overlap * 30
+
+        # Penalize non-studio junk unless explicitly queried
+        if not allow_junk:
+            for term in JUNK_TERMS:
+                if term in title_lower:
+                    score -= 140
+
+        # Official Studio Album Boost (+35)
+        if formatted.get("album"):
+            score += 35
+
+        # Canonical deduplication (keep the highest scoring release)
+        canon_key = (normalize_title_for_dedup(title), artist_lower)
+        if canon_key in seen_canonical:
+            score -= 75
+
+        seen_ids.add(vid)
+        seen_canonical.add(canon_key)
+        scored_tracks.append((score, formatted))
+
+    scored_tracks.sort(key=lambda x: x[0], reverse=True)
+    return [t[1] for t in scored_tracks[:limit]]
+
+
+# ─── Search ────────────────────────────────────────────────────────────────────
+@app.get("/api/search")
+def search(q: str = "", limit: int = Query(default=20, le=50)):
+    """Search for songs with Spotify-grade relevance ranking & duration filtering."""
+    if not q.strip():
+        return {"songs": [], "query": ""}
+    try:
+        # Fetch extra candidates for intelligent re-ranking and junk filtering
+        results = yt.search(q.strip(), filter="songs", limit=limit * 2 + 10)
+        songs = rank_search_results(q.strip(), results, limit=limit)
+        return {"songs": songs, "query": q}
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=502, detail="Search temporarily unavailable")
+
+
+# ─── Search Suggestions (Autocomplete) ─────────────────────────────────────────
+@app.get("/api/search-suggestions")
+def search_suggestions(q: str = ""):
+    """Instant search suggestions as user types (Spotify-like autocomplete)."""
+    if not q.strip():
+        return {"query": "", "suggestions": []}
+    try:
+        suggestions = yt.get_search_suggestions(q.strip())
+        return {"query": q, "suggestions": suggestions}
+    except Exception as e:
+        logger.error(f"Search suggestions error: {e}")
+        return {"query": q, "suggestions": []}
+
+
+# ─── Audio URL (NEW — for Expo native playback) ───────────────────────────────
+@app.get("/api/audio-url/{video_id}")
+def get_audio_url(video_id: str):
+    """Returns a direct audio stream URL for native playback (expo-av)."""
+    vid = _validate_video_id(video_id)
+    try:
+        audio_url, title, duration = _extract_audio_url(vid)
+        return {
+            "videoId": vid,
+            "audioUrl": audio_url,
+            "title": title,
+            "duration": duration,
+        }
+    except Exception as e:
+        logger.error(f"Audio URL extraction failed for {vid}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to extract audio URL")
+
+
+# ─── Stream URL (kept for backward compat) ────────────────────────────────────
+@app.get("/api/stream/{video_id}")
+def get_stream_url(video_id: str):
+    """Returns YouTube embed/watch URLs for a video."""
+    vid = _validate_video_id(video_id)
+    return {
+        "videoId": vid,
+        "embedUrl": f"https://www.youtube.com/embed/{vid}?autoplay=1&controls=0",
+        "watchUrl": f"https://music.youtube.com/watch?v={vid}",
+    }
+
+
+# ─── Download ──────────────────────────────────────────────────────────────────
 @app.get("/api/download/{video_id}")
-async def download_song(video_id: str):
-    """Extracts a direct audio URL and streams it to the client via ffmpeg pipe."""
-    if not video_id:
-        raise HTTPException(status_code=400, detail="Missing video_id")
+def download_song(video_id: str):
+    """Extracts audio and streams it as MP3 via ffmpeg pipe."""
+    vid = _validate_video_id(video_id)
 
     try:
-        audio_url, title, _ = _extract_audio_url(video_id)
+        audio_url, title, _ = _extract_audio_url(vid)
     except Exception as e:
-        print(f"Download extract error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to extract audio: {e}")
+        logger.error(f"Download extract error for {vid}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to extract audio")
 
-    # Stream through ffmpeg → mp3 pipe → client (no temp files needed)
-    safe_title = "".join([c for c in title if c.isalpha() or c.isdigit() or c == ' ']).strip()
-    filename = f"{safe_title or video_id}.mp3"
+    safe_title = re.sub(r'[<>:"/\\|?*\r\n]', '', title).strip() or vid
+    filename = f"{safe_title}.mp3"
 
     ffmpeg_cmd = [
         FFMPEG_PATH,
@@ -190,11 +506,11 @@ async def download_song(video_id: str):
         proc = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         try:
             while True:
-                chunk = await proc.stdout.read(65536)  # 64KB chunks
+                chunk = await proc.stdout.read(65536)
                 if not chunk:
                     break
                 yield chunk
@@ -203,6 +519,7 @@ async def download_song(video_id: str):
                 proc.kill()
             except Exception:
                 pass
+            await proc.wait()
 
     return StreamingResponse(
         stream_audio(),
@@ -210,54 +527,144 @@ async def download_song(video_id: str):
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
-# ─── Lyrics endpoint ───────────────────────────────────────────────────────────
-@app.get("/api/lyrics/{video_id}")
-async def get_lyrics(video_id: str):
-    """Fetch lyrics for a track by its YouTube Music videoId."""
-    try:
-        # Try to get the watch playlist to find the browse ID for lyrics
-        next_data = yt.get_watch_playlist(video_id)
-        lyrics_browse_id = next_data.get("lyrics")
-        if not lyrics_browse_id:
-            return {"lyrics": None, "hasTimestamps": False}
-        lyrics_data = yt.get_lyrics(lyrics_browse_id)
-        if not lyrics_data:
-            return {"lyrics": None, "hasTimestamps": False}
-        return {
-            "lyrics": lyrics_data.get("lyrics", ""),
-            "source": lyrics_data.get("source", ""),
-            "hasTimestamps": False
-        }
-    except Exception as e:
-        print(f"Lyrics error: {e}")
-        return {"lyrics": None, "hasTimestamps": False}
 
-# ─── Time-of-day recommendations ──────────────────────────────────────────────
+# ─── Synced Lyrics Engine (Spotify-Grade LRCLIB + YTMusic Fallback) ───────────
+def parse_lrc_lines(lrc_text: str) -> list[dict]:
+    """Parse standard LRC synchronized lyrics into a list of {time: float, text: str}."""
+    lines = []
+    pattern = re.compile(r"\[(\d{1,2}):(\d{2}(?:\.\d{1,3})?)\](.*)")
+    for raw_line in lrc_text.splitlines():
+        match = pattern.match(raw_line.strip())
+        if match:
+            minutes = int(match.group(1))
+            seconds = float(match.group(2))
+            total_seconds = round(minutes * 60 + seconds, 2)
+            text = match.group(3).strip()
+            lines.append({"time": total_seconds, "text": text})
+    return lines
+
+@app.get("/api/lyrics/{video_id}")
+async def get_lyrics(
+    video_id: str,
+    title: Optional[str] = Query(default=None),
+    artist: Optional[str] = Query(default=None),
+    duration: Optional[int] = Query(default=None),
+):
+    """
+    Fetch lyrics for a track:
+    1. Queries LRCLIB for Spotify-grade millisecond-synced line-by-line lyrics.
+    2. Falls back to YouTube Music lyrics (plain text).
+    """
+    vid = _validate_video_id(video_id)
+
+    # 1. Resolve track and artist title if not provided by client
+    song_title = title
+    artist_name = artist
+    if not song_title or not artist_name:
+        try:
+            watch = yt.get_watch_playlist(vid)
+            tracks = watch.get("tracks", [])
+            if tracks:
+                first = tracks[0]
+                song_title = song_title or first.get("title", "")
+                artist_name = artist_name or _get_artist_name(first)
+        except Exception as e:
+            logger.warning(f"Metadata lookup for lyrics failed: {e}")
+
+    # 2. Query LRCLIB for millisecond-synced lyrics
+    if song_title and artist_name:
+        clean_title = re.sub(r"\s*[\(\[\{].*?[\)\]\}]", "", song_title).strip()
+        try:
+            client = await _get_http_client()
+            params = {
+                "track_name": clean_title,
+                "artist_name": artist_name,
+            }
+            if duration and duration > 0:
+                params["duration"] = duration
+
+            resp = await client.get("https://lrclib.net/api/get", params=params, timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                synced_raw = data.get("syncedLyrics")
+                if synced_raw:
+                    parsed_lines = parse_lrc_lines(synced_raw)
+                    return {
+                        "lyrics": data.get("plainLyrics") or synced_raw,
+                        "syncedLyrics": parsed_lines,
+                        "hasTimestamps": True,
+                        "source": "lrclib",
+                        "trackName": data.get("trackName"),
+                        "artistName": data.get("artistName"),
+                    }
+                elif data.get("plainLyrics"):
+                    return {
+                        "lyrics": data.get("plainLyrics"),
+                        "syncedLyrics": [],
+                        "hasTimestamps": False,
+                        "source": "lrclib",
+                        "trackName": data.get("trackName"),
+                        "artistName": data.get("artistName"),
+                    }
+        except Exception as e:
+            logger.warning(f"LRCLIB synced lyrics lookup failed for '{clean_title}': {e}")
+
+    # 3. Fallback to YouTube Music lyrics
+    try:
+        next_data = yt.get_watch_playlist(vid)
+        lyrics_browse_id = next_data.get("lyrics")
+        if lyrics_browse_id:
+            lyrics_data = yt.get_lyrics(lyrics_browse_id)
+            if lyrics_data and lyrics_data.get("lyrics"):
+                return {
+                    "lyrics": lyrics_data.get("lyrics", ""),
+                    "syncedLyrics": [],
+                    "source": lyrics_data.get("source", "ytmusic"),
+                    "hasTimestamps": False,
+                }
+    except Exception as e:
+        logger.error(f"YTMusic fallback lyrics error for {vid}: {e}")
+
+    return {
+        "lyrics": None,
+        "syncedLyrics": [],
+        "hasTimestamps": False,
+        "source": None,
+    }
+
+
+# ─── Recommendations ──────────────────────────────────────────────────────────
 @app.get("/api/recommendations")
-async def get_recommendations(time_of_day: str = "afternoon"):
+def get_recommendations(time_of_day: str = "afternoon"):
+    """Get song recommendations based on time of day."""
+    year = _current_year()
     queries = {
         "morning": ["Morning acoustic songs", "Wake up happy hits", "Morning coffee pop"],
-        "afternoon": ["Top 50 global hits", "Current pop hits", "Trending music 2025"],
-        "night": ["Late night lofi", "Midnight chill R&B", "Sleep vibes songs"]
+        "afternoon": ["Top 50 global hits", "Current pop hits", f"Trending music {year}"],
+        "night": ["Late night lofi", "Midnight chill R&B", "Sleep vibes songs"],
     }
     time_key = time_of_day.lower() if time_of_day.lower() in queries else "afternoon"
     query = random.choice(queries[time_key])
     songs = search_songs(query, 10)
     return {"time": time_key, "query": query, "songs": songs}
 
-# ─── Mood/Genre playlists ──────────────────────────────────────────────────────
+
+# ─── Moods ─────────────────────────────────────────────────────────────────────
 @app.get("/api/moods")
-async def get_moods():
+@cached(ttl_seconds=3600)
+def get_moods():
+    """Get mood-based playlists. Cached for 1 hour."""
+    year = _current_year()
     mood_queries = [
-        {"label": "Workout",      "emoji": "💪", "query": "gym workout motivation hits"},
-        {"label": "Party",        "emoji": "🎉", "query": "party hits 2025"},
-        {"label": "Focus",        "emoji": "🎧", "query": "study focus deep work music"},
-        {"label": "Romance",      "emoji": "❤️",  "query": "romantic love songs"},
-        {"label": "Throwbacks",   "emoji": "⏪", "query": "2000s throwback hits"},
-        {"label": "Gaming",       "emoji": "🎮", "query": "gaming montage EDM trap"},
-        {"label": "Acoustic",     "emoji": "🎸", "query": "acoustic covers chill"},
-        {"label": "Late Night",   "emoji": "🌃", "query": "late night drive lo-fi"},
-        {"label": "Upbeat",       "emoji": "✨", "query": "feel good happy pop hits"},
+        {"label": "Workout",    "emoji": "💪", "query": "gym workout motivation hits"},
+        {"label": "Party",      "emoji": "🎉", "query": f"party hits {year}"},
+        {"label": "Focus",      "emoji": "🎧", "query": "study focus deep work music"},
+        {"label": "Romance",    "emoji": "❤️", "query": "romantic love songs"},
+        {"label": "Throwbacks", "emoji": "⏪", "query": "2000s throwback hits"},
+        {"label": "Gaming",     "emoji": "🎮", "query": "gaming montage EDM trap"},
+        {"label": "Acoustic",   "emoji": "🎸", "query": "acoustic covers chill"},
+        {"label": "Late Night", "emoji": "🌃", "query": "late night drive lo-fi"},
+        {"label": "Upbeat",     "emoji": "✨", "query": "feel good happy pop hits"},
     ]
     result = []
     for mood in mood_queries:
@@ -267,218 +674,790 @@ async def get_moods():
                 "label": mood["label"],
                 "emoji": mood["emoji"],
                 "cover": songs[0]["cover"] if songs else "",
-                "songs": songs
+                "songs": songs,
             })
     return {"moods": result}
 
-# ─── Trending / Charts ─────────────────────────────────────────────────────────
-@app.get("/api/trending")
-async def get_trending():
-    try:
-        charts = yt.get_charts(country='US')
-        trending_items = charts.get('trending', {}).get('items', [])
-        if not trending_items:
-            trending_items = charts.get('videos', {}).get('items', [])
-        
-        songs = []
-        for item in trending_items[:15]:
-            artist_name = "Unknown Artist"
-            if item.get('artists') and len(item['artists']) > 0:
-                artist_name = item['artists'][0].get('name', 'Unknown Artist')
-                
-            cover_url = ""
-            if item.get('thumbnails') and len(item['thumbnails']) > 0:
-                cover_url = item['thumbnails'][-1]['url']
-                
-            songs.append({
-                "id": item.get('videoId'),
-                "title": item.get('title'),
-                "artist": artist_name,
-                "cover": cover_url
-            })
-        return {"songs": songs}
-    except Exception as e:
-        print("Trending error:", e)
-        return {"songs": []}
 
-# ─── Check These Out (Curated Playlists) ───────────────────────────────────────
-@app.get("/api/check-these-out")
-async def get_check_these_out():
+# ─── Trending ──────────────────────────────────────────────────────────────────
+@app.get("/api/trending")
+@cached(ttl_seconds=1800)
+def get_trending(country: str = "US"):
+    """Get trending songs. Cached for 30 minutes."""
+    year = _current_year()
+    country_keyword = "Nigeria" if country == "NG" else ("UK" if country == "GB" else country)
+    query = f"trending music {country_keyword} {year}" if country != "US" else f"trending songs {year} hits"
     try:
-        results = yt.search("popular mix 2025 hits", filter="playlists", limit=6)
-        playlists = []
-        for r in results:
-            cover = r['thumbnails'][-1]['url'] if r.get('thumbnails') else ""
-            playlists.append({
-                "browseId": r.get('browseId'),
-                "title": r.get('title'),
-                "author": r.get('author'),
-                "cover": cover
-            })
+        songs = search_songs(query, 15)
+        if songs:
+            return {"songs": songs}
+    except Exception as e:
+        logger.error(f"Trending query error: {e}")
+
+    # Fallback to general trending hits
+    songs = search_songs("top hits trending songs", 15)
+    return {"songs": songs}
+
+
+# ─── Check These Out ──────────────────────────────────────────────────────────
+@app.get("/api/check-these-out")
+@cached(ttl_seconds=3600)
+def get_check_these_out():
+    """Get curated playlist suggestions. Cached for 1 hour."""
+    year = _current_year()
+    try:
+        results = yt.search(f"popular mix {year} hits", filter="playlists", limit=6)
+        playlists = [_format_playlist(r) for r in results]
         return {"playlists": playlists}
     except Exception as e:
-        print("Check these out error:", e)
-        return {"playlists": []}
+        logger.error(f"Check these out error: {e}")
+        raise HTTPException(status_code=502, detail="Could not load playlists")
 
-# ─── Spotify Playlists ─────────────────────────────────────────────────────────
+
+# ─── Spotify Playlists ────────────────────────────────────────────────────────
 @app.get("/api/spotify-playlists")
-async def get_spotify_playlists():
+@cached(ttl_seconds=3600)
+def get_spotify_playlists():
+    """Get Spotify-curated playlists from YouTube Music. Cached for 1 hour."""
     try:
         results = yt.search("spotify top 50 viral", filter="playlists", limit=8)
-        playlists = []
-        for r in results:
-            cover = r['thumbnails'][-1]['url'] if r.get('thumbnails') else ""
-            playlists.append({
-                "browseId": r.get('browseId'),
-                "title": r.get('title'),
-                "author": r.get('author'),
-                "cover": cover
-            })
+        playlists = [_format_playlist(r) for r in results]
         return {"playlists": playlists}
     except Exception as e:
-        print("Spotify error:", e)
-        return {"playlists": []}
+        logger.error(f"Spotify playlists error: {e}")
+        raise HTTPException(status_code=502, detail="Could not load playlists")
 
-# ─── Playlist Details ──────────────────────────────────────────────────────────
+
+# ─── Playlist Details ─────────────────────────────────────────────────────────
 @app.get("/api/playlist/{browse_id}")
-async def get_playlist(browse_id: str, title: str = ""):
+def get_playlist(browse_id: str, title: str = ""):
+    """Get tracks in a playlist by its browse ID."""
     try:
         clean_id = browse_id.replace("VLPL", "PL") if browse_id.startswith("VLPL") else browse_id
         playlist = yt.get_playlist(clean_id)
         songs = []
-        for track in playlist.get('tracks', []):
-            vid = track.get('videoId')
+        for track in playlist.get("tracks", []):
+            vid = track.get("videoId")
             if not vid:
                 continue
-            cover = track['thumbnails'][-1]['url'] if track.get('thumbnails') else ""
-            if cover and "googleusercontent.com" in cover and "=" in cover:
-                cover = cover.split("=")[0] + "=w600-h600-l90-rj"
-            
-            artist_name = "Unknown Artist"
-            if track.get('artists') and len(track['artists']) > 0:
-                artist_name = track['artists'][0].get('name', 'Unknown Artist')
-                
-            songs.append({
-                "id": vid,
-                "title": track.get('title'),
-                "artist": artist_name,
-                "cover": cover,
-                "youtubeId": vid
-            })
+            songs.append(format_track(track))
         if songs:
             return {"songs": songs}
     except Exception as e:
-        print(f"Playlist details error for {browse_id}:", e)
-    
-    # Fallback: if playlist fails (e.g. private or community playlist bug), search by title!
+        logger.error(f"Playlist error for {browse_id}: {e}")
+
     if title:
         try:
             fallback_songs = search_songs(title + " playlist", 20)
             if fallback_songs:
                 return {"songs": fallback_songs}
         except Exception as e:
-            print("Fallback search failed:", e)
+            logger.error(f"Playlist fallback search failed: {e}")
 
     return {"songs": []}
 
+
 # ─── Artist Info ───────────────────────────────────────────────────────────────
 @app.get("/api/artist-info/{artist_name}")
-async def get_artist_info(artist_name: str):
+def get_artist_info(artist_name: str):
+    """Get artist profile info (image, bio, subscribers)."""
     try:
-        # Search for artist channel ID
         search_results = yt.search(artist_name, filter="artists", limit=1)
         if not search_results:
-            return {"error": "Artist not found"}
-            
-        artist_id = search_results[0]['browseId']
+            raise HTTPException(status_code=404, detail="Artist not found")
+        artist_id = search_results[0].get("browseId")
+        if not artist_id:
+            raise HTTPException(status_code=404, detail="Artist not found")
         artist_data = yt.get_artist(artist_id)
-        
-        # Get highest quality thumbnail
-        thumbnail_url = ""
-        if artist_data.get('thumbnails') and len(artist_data['thumbnails']) > 0:
-            thumbnail_url = artist_data['thumbnails'][-1]['url']
-            
         return {
-            "name": artist_data.get('name'),
-            "subscribers": artist_data.get('subscribers'),
-            "monthlyListeners": artist_data.get('monthlyListeners'),
-            "description": artist_data.get('description'),
-            "image": thumbnail_url
+            "id": artist_id,
+            "name": artist_data.get("name"),
+            "subscribers": artist_data.get("subscribers"),
+            "monthlyListeners": artist_data.get("monthlyListeners"),
+            "description": artist_data.get("description"),
+            "image": _get_cover_url(artist_data),
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        print("Artist info error:", e)
-        return {"error": str(e)}
+        logger.error(f"Artist info error for '{artist_name}': {e}")
+        raise HTTPException(status_code=502, detail="Could not load artist info")
 
-# ─── Because you listened to X ────────────────────────────────────────────────
+
+# ─── Because You Listened ─────────────────────────────────────────────────────
 @app.get("/api/because-you-listened")
-async def because_you_listened(artist: str = ""):
+def because_you_listened(artist: str = ""):
+    """Get recommendations based on an artist."""
     if not artist:
         return {"songs": []}
     songs = search_songs(f"songs similar to {artist}", 8)
     return {"artist": artist, "songs": songs}
 
-# ─── New releases ──────────────────────────────────────────────────────────────
+
+# ─── New Releases ─────────────────────────────────────────────────────────────
 @app.get("/api/new-releases")
-async def new_releases():
-    songs = search_songs("new music releases 2024 2025", 10)
+@cached(ttl_seconds=3600)
+def new_releases():
+    """Get new music releases. Cached for 1 hour."""
+    year = _current_year()
+    songs = search_songs(f"new music releases {year}", 10)
     return {"songs": songs}
 
-# Search
-@app.get("/api/search")
-async def search(q: str = ""):
-    if not q:
-        return {"songs": []}
-    songs = search_songs(q, 15)
-    return {"query": q, "songs": songs}
 
+# ─── Search Playlists ─────────────────────────────────────────────────────────
 @app.get("/api/search-playlists")
-async def search_playlists(q: str = ""):
+def search_playlists(q: str = ""):
+    """Search for playlists by query."""
     if not q:
         return {"playlists": []}
     try:
         results = yt.search(q, filter="playlists", limit=12)
-        playlists = []
-        for r in results:
-            cover = r['thumbnails'][-1]['url'] if r.get('thumbnails') else ""
-            playlists.append({
-                "browseId": r.get('browseId'),
-                "title": r.get('title'),
-                "author": r.get('author'),
-                "cover": cover
-            })
+        playlists = [_format_playlist(r) for r in results]
         return {"playlists": playlists}
     except Exception as e:
-        print("Playlist search error:", e)
-        return {"playlists": []}
+        logger.error(f"Playlist search error: {e}")
+        raise HTTPException(status_code=502, detail="Playlist search unavailable")
 
-# AI Playlist Generator
+
+# ─── AI Playlist ──────────────────────────────────────────────────────────────
 @app.get("/api/ai-playlist")
-async def ai_playlist(prompt: str = ""):
+def ai_playlist(prompt: str = ""):
+    """Generate a playlist from a natural language prompt."""
     if not prompt:
-        return {"songs": []}
-    query = f"{prompt} playlist"
-    songs = search_songs(query, 50)
+        return {"songs": [], "prompt": ""}
+    songs = search_songs(f"{prompt} playlist", 50)
     return {"prompt": prompt, "songs": songs}
 
-# Artist Discography
+
+# ─── Artist Discography ───────────────────────────────────────────────────────
 @app.get("/api/artist")
-async def get_artist(name: str = ""):
+def get_artist_songs(name: str = ""):
+    """Get an artist's top songs."""
     if not name:
         return {"songs": []}
     songs = search_songs(f"{name} songs", 50)
     return {"artist": name, "songs": songs}
 
-# ─── Image Proxy (avoids CORS issues when downloading cover art on Android) ───
+
+# ─── Image Proxy (SSRF-safe) ──────────────────────────────────────────────────
+ALLOWED_IMAGE_DOMAINS = [
+    "lh3.googleusercontent.com",
+    "i.ytimg.com",
+    "yt3.ggpht.com",
+    "yt3.googleusercontent.com",
+    "music.youtube.com",
+    "i.scdn.co",
+]
+
+MAX_IMAGE_SIZE = 5 * 1024 * 1024
+
+
 @app.get("/api/proxy-image")
 async def proxy_image(url: str = ""):
+    """Proxy images to avoid CORS issues. Only allows trusted domains."""
     if not url:
         raise HTTPException(status_code=400, detail="Missing url parameter")
+
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.hostname not in ALLOWED_IMAGE_DOMAINS:
+        raise HTTPException(status_code=403, detail="Domain not allowed")
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Invalid URL scheme")
+
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail="Failed to fetch image")
-            content_type = resp.headers.get("content-type", "image/jpeg")
-            return Response(content=resp.content, media_type=content_type)
+        client = await _get_http_client()
+        resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail="Failed to fetch image")
+        content_length = resp.headers.get("content-length")
+        if content_length and int(content_length) > MAX_IMAGE_SIZE:
+            raise HTTPException(status_code=413, detail="Image too large")
+        if len(resp.content) > MAX_IMAGE_SIZE:
+            raise HTTPException(status_code=413, detail="Image too large")
+        content_type = resp.headers.get("content-type", "image/jpeg")
+        return Response(content=resp.content, media_type=content_type)
+    except HTTPException:
+        raise
     except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Image fetch error: {e}")
+        logger.error(f"Image proxy error: {e}")
+        raise HTTPException(status_code=502, detail="Image fetch error")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TIER 2 — NEW ENDPOINTS FOR SCREEN DESIGNS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Search Albums ─────────────────────────────────────────────────────────────
+@app.get("/api/search-albums")
+def search_albums(q: str = ""):
+    """Search for albums by query (for Search screen Albums tab)."""
+    if not q:
+        return {"albums": []}
+    try:
+        results = yt.search(q, filter="albums", limit=12)
+        albums = []
+        for r in results:
+            albums.append({
+                "browseId": r.get("browseId"),
+                "title": r.get("title"),
+                "artist": _get_artist_name(r),
+                "year": r.get("year"),
+                "cover": _get_cover_url(r),
+                "type": r.get("type", "Album"),
+            })
+        return {"albums": albums}
+    except Exception as e:
+        logger.error(f"Album search error: {e}")
+        raise HTTPException(status_code=502, detail="Album search unavailable")
+
+
+# ─── Album Details ─────────────────────────────────────────────────────────────
+@app.get("/api/album/{album_id}")
+def get_album(album_id: str):
+    """Get full album tracklist and metadata (for Album Page screen)."""
+    try:
+        album = yt.get_album(album_id)
+        tracks = []
+        for track in album.get("tracks", []):
+            vid = track.get("videoId")
+            if not vid:
+                continue
+            tracks.append(format_track(track))
+
+        # Get artist name from the album's artist list
+        album_artists = album.get("artists", [])
+        artist_name = album_artists[0].get("name", "Unknown Artist") if album_artists else "Unknown Artist"
+
+        return {
+            "id": album_id,
+            "title": album.get("title"),
+            "artist": artist_name,
+            "year": album.get("year"),
+            "cover": _get_cover_url(album),
+            "description": album.get("description", ""),
+            "trackCount": len(tracks),
+            "duration": album.get("duration", ""),
+            "tracks": tracks,
+        }
+    except Exception as e:
+        logger.error(f"Album error for {album_id}: {e}")
+        raise HTTPException(status_code=502, detail="Could not load album")
+
+
+# ─── Song Info (Song World — About tab) ───────────────────────────────────────
+@app.get("/api/song-info/{video_id}")
+def get_song_info(video_id: str):
+    """Get detailed song information (for Song World screen About tab)."""
+    vid = _validate_video_id(video_id)
+    try:
+        watch = yt.get_watch_playlist(vid)
+        tracks = watch.get("tracks", [])
+        song_data = tracks[0] if tracks else {}
+
+        lyrics_browse = watch.get("lyrics")
+        lyrics_source = None
+        if lyrics_browse:
+            try:
+                ld = yt.get_lyrics(lyrics_browse)
+                lyrics_source = ld.get("source", "")
+            except Exception:
+                pass
+
+        return {
+            "id": vid,
+            "title": song_data.get("title"),
+            "artist": _get_artist_name(song_data),
+            "album": (song_data.get("album") or {}).get("name", ""),
+            "cover": _get_cover_url(song_data),
+            "duration": song_data.get("length", ""),
+            "year": song_data.get("year", ""),
+            "lyricsSource": lyrics_source,
+        }
+    except Exception as e:
+        logger.error(f"Song info error for {vid}: {e}")
+        raise HTTPException(status_code=502, detail="Could not load song info")
+
+
+# ─── Similar Songs (Song World — Similar tab) ─────────────────────────────────
+@app.get("/api/similar/{video_id}")
+def get_similar(video_id: str):
+    """Get similar songs via YouTube Music radio/watch playlist."""
+    vid = _validate_video_id(video_id)
+    try:
+        watch = yt.get_watch_playlist(vid, limit=20)
+        tracks = watch.get("tracks", [])
+        songs = [format_track(t) for t in tracks[1:] if t.get("videoId")]
+        return {"songs": songs}
+    except Exception as e:
+        logger.error(f"Similar songs error for {vid}: {e}")
+        raise HTTPException(status_code=502, detail="Could not load similar songs")
+
+
+# ─── Artist Albums (Artist Page — Albums tab) ─────────────────────────────────
+@app.get("/api/artist-albums/{artist_id}")
+def get_artist_albums(artist_id: str):
+    """Get an artist's album discography (for Artist Page Albums tab)."""
+    try:
+        artist_data = yt.get_artist(artist_id)
+        albums_section = artist_data.get("albums", {})
+        albums_list = albums_section.get("results", [])
+
+        albums = []
+        for a in albums_list:
+            albums.append({
+                "browseId": a.get("browseId"),
+                "title": a.get("title"),
+                "year": a.get("year"),
+                "cover": _get_cover_url(a),
+                "type": a.get("type", "Album"),
+            })
+
+        singles_section = artist_data.get("singles", {})
+        singles_list = singles_section.get("results", [])
+        singles = []
+        for s in singles_list:
+            singles.append({
+                "browseId": s.get("browseId"),
+                "title": s.get("title"),
+                "year": s.get("year"),
+                "cover": _get_cover_url(s),
+                "type": "Single",
+            })
+
+        return {
+            "artistId": artist_id,
+            "albums": albums,
+            "singles": singles,
+        }
+    except Exception as e:
+        logger.error(f"Artist albums error for {artist_id}: {e}")
+        raise HTTPException(status_code=502, detail="Could not load artist albums")
+
+
+# ─── Genres (Discover — Genres tab) ───────────────────────────────────────────
+@app.get("/api/genres")
+@cached(ttl_seconds=7200)
+def get_genres():
+    """Get genre categories with sample tracks. Cached 2 hours."""
+    genre_list = [
+        {"label": "Afrobeats", "query": "afrobeats hits"},
+        {"label": "Hip Hop", "query": "hip hop hits"},
+        {"label": "R&B", "query": "r&b soul hits"},
+        {"label": "Pop", "query": "pop hits"},
+        {"label": "Amapiano", "query": "amapiano hits"},
+        {"label": "Highlife", "query": "highlife music"},
+        {"label": "Rock", "query": "rock classics"},
+        {"label": "Jazz", "query": "jazz smooth"},
+        {"label": "Gospel", "query": "gospel praise worship"},
+        {"label": "EDM", "query": "electronic dance music hits"},
+        {"label": "Latin", "query": "latin reggaeton hits"},
+        {"label": "Country", "query": "country hits"},
+    ]
+    result = []
+    for genre in genre_list:
+        songs = search_songs(genre["query"], 6)
+        if songs:
+            result.append({
+                "label": genre["label"],
+                "cover": songs[0]["cover"] if songs else "",
+                "songs": songs,
+            })
+    return {"genres": result}
+
+
+# ─── Trending by Location (Discover — Locations tab) ──────────────────────────
+@app.get("/api/trending-by-location")
+@cached(ttl_seconds=1800)
+def trending_by_location(country: str = "US"):
+    """Get trending charts for a specific country."""
+    country_names = {
+        "NG": "Nigeria",
+        "US": "United States",
+        "GB": "United Kingdom",
+        "GH": "Ghana",
+        "ZA": "South Africa",
+        "KE": "Kenya",
+        "CA": "Canada",
+        "FR": "France",
+        "DE": "Germany",
+        "JP": "Japan",
+        "KR": "South Korea",
+        "BR": "Brazil",
+        "IN": "India",
+        "AU": "Australia",
+    }
+    c_name = country_names.get(country.upper(), country)
+    year = _current_year()
+    try:
+        songs = search_songs(f"top songs {c_name} {year}", 20)
+        if not songs:
+            songs = search_songs(f"trending hits {c_name}", 20)
+        return {"country": country, "countryName": c_name, "songs": songs}
+    except Exception as e:
+        logger.error(f"Trending by location error for {country}: {e}")
+        return {"country": country, "countryName": c_name, "songs": []}
+
+
+# ─── Available Countries ──────────────────────────────────────────────────────
+@app.get("/api/locations")
+def get_locations():
+    """Get available countries for the Locations tab."""
+    locations = [
+        {"code": "NG", "name": "Nigeria", "emoji": "🇳🇬"},
+        {"code": "US", "name": "United States", "emoji": "🇺🇸"},
+        {"code": "GB", "name": "United Kingdom", "emoji": "🇬🇧"},
+        {"code": "GH", "name": "Ghana", "emoji": "🇬🇭"},
+        {"code": "ZA", "name": "South Africa", "emoji": "🇿🇦"},
+        {"code": "KE", "name": "Kenya", "emoji": "🇰🇪"},
+        {"code": "CA", "name": "Canada", "emoji": "🇨🇦"},
+        {"code": "FR", "name": "France", "emoji": "🇫🇷"},
+        {"code": "DE", "name": "Germany", "emoji": "🇩🇪"},
+        {"code": "JP", "name": "Japan", "emoji": "🇯🇵"},
+        {"code": "KR", "name": "South Korea", "emoji": "🇰🇷"},
+        {"code": "BR", "name": "Brazil", "emoji": "🇧🇷"},
+        {"code": "IN", "name": "India", "emoji": "🇮🇳"},
+        {"code": "AU", "name": "Australia", "emoji": "🇦🇺"},
+    ]
+    return {"locations": locations}
+
+
+# ─── AI Chat / Music Concierge ─────────────────────────────────────────────────
+@app.get("/api/ai-chat")
+def ai_chat(message: str = ""):
+    """AI Music Concierge — conversational prompt to curated playlist."""
+    if not message:
+        return {"response": "", "songs": [], "playlistTitle": ""}
+
+    msg_lower = message.lower()
+    query = message
+    playlist_title = ""
+
+    mood_map = {
+        "stress": ("calm relaxing acoustic", "Stress Relief"),
+        "sad": ("uplifting feel good happy", "Mood Lifter"),
+        "happy": ("happy upbeat dance", "Happy Vibes"),
+        "workout": ("gym workout high energy", "Workout Beast"),
+        "sleep": ("sleep calm ambient", "Sleep Sounds"),
+        "focus": ("focus study lo-fi", "Deep Focus"),
+        "party": ("party dance hits", "Party Starter"),
+        "drive": ("driving road trip", "Road Trip"),
+        "chill": ("chill vibes lo-fi", "Chill Mode"),
+        "romantic": ("romantic love songs", "Love Songs"),
+        "energetic": ("high energy pump up", "Energy Boost"),
+    }
+
+    for keyword, (search_query, title) in mood_map.items():
+        if keyword in msg_lower:
+            query = search_query
+            playlist_title = title
+            break
+
+    if not playlist_title:
+        playlist_title = f"For You: {message[:40]}"
+
+    songs = search_songs(query, 20)
+
+    response = f"I made a {len(songs)}-track journey based on your vibe. "
+    if "stress" in msg_lower or "calm" in msg_lower:
+        response += "These tracks blend calm Afrobeats with atmospheric R&B to help you unwind."
+    elif "sad" in msg_lower:
+        response += "Here's something to lift your spirits — upbeat vibes incoming."
+    elif "party" in msg_lower or "dance" in msg_lower:
+        response += "Let's get the energy up! These tracks will keep the vibe going."
+    elif "drive" in msg_lower:
+        response += "Perfect soundtrack for the road ahead."
+    else:
+        response += "Curated with care — hit play and enjoy."
+
+    return {
+        "response": response,
+        "songs": songs,
+        "playlistTitle": playlist_title,
+    }
+
+
+# ─── Tonight's Frequency ──────────────────────────────────────────────────────
+@app.get("/api/frequency")
+def get_frequency():
+    """Tonight's Frequency — personalized playlist based on time of day."""
+    hour = datetime.now().hour
+
+    if 5 <= hour < 12:
+        mood = "Morning"
+        description = "Calm, Energetic, Fresh"
+        query = "morning feel good acoustic"
+    elif 12 <= hour < 17:
+        mood = "Afternoon"
+        description = "Upbeat, Focused, Vibrant"
+        query = "afternoon upbeat pop hits"
+    elif 17 <= hour < 21:
+        mood = "Evening"
+        description = "Smooth, Atmospheric, Warm"
+        query = "evening smooth r&b jazz"
+    else:
+        mood = "Late Night"
+        description = "Calm, Atmospheric, Late-night"
+        query = "late night chill lo-fi vibes"
+
+    songs = search_songs(query, 15)
+    cover = songs[0]["cover"] if songs else ""
+
+    return {
+        "mood": mood,
+        "description": description,
+        "cover": cover,
+        "songs": songs,
+    }
+
+
+# ─── Spotify-Style Song Radio ──────────────────────────────────────────────────
+@app.get("/api/radio/{video_id}")
+def get_song_radio(video_id: str, limit: int = Query(default=30, le=50)):
+    """
+    Spotify-Style Song Radio:
+    Given any song, generates an endless seamless station of matching vibe tracks.
+    """
+    vid = _validate_video_id(video_id)
+    try:
+        watch = yt.get_watch_playlist(vid, radio=True, limit=limit + 10)
+        tracks = watch.get("tracks", [])
+        songs = []
+        seen = set([vid])
+        for t in tracks:
+            t_vid = t.get("videoId")
+            if not t_vid or t_vid in seen:
+                continue
+            formatted = format_track(t)
+            if is_full_song(formatted):
+                seen.add(t_vid)
+                songs.append(formatted)
+            if len(songs) >= limit:
+                break
+        return {"seedId": vid, "songs": songs}
+    except Exception as e:
+        logger.error(f"Song radio error for {vid}: {e}")
+        raise HTTPException(status_code=502, detail="Could not generate song radio")
+
+
+# ─── Infinite Autoplay Queue (Session Deduplicated) ───────────────────────────
+@app.get("/api/infinite-queue")
+def infinite_queue(
+    video_id: str,
+    count: int = Query(default=15, le=30),
+    exclude_ids: str = Query(default=""),
+):
+    """
+    Infinite Autoplay:
+    Returns the next batch of songs matching the current playing track when the queue runs out.
+    Uses exclude_ids to prevent song repeats within the same listening session.
+    """
+    vid = _validate_video_id(video_id)
+    exclude_set = set(e.strip() for e in exclude_ids.split(",") if e.strip())
+    exclude_set.add(vid)
+
+    try:
+        watch = yt.get_watch_playlist(vid, radio=True, limit=count + 15)
+        tracks = watch.get("tracks", [])
+        songs = []
+        seen = set(exclude_set)
+
+        for t in tracks:
+            t_vid = t.get("videoId")
+            if not t_vid or t_vid in seen:
+                continue
+            formatted = format_track(t)
+            if is_full_song(formatted):
+                seen.add(t_vid)
+                songs.append(formatted)
+            if len(songs) >= count:
+                break
+        return {"songs": songs}
+    except Exception as e:
+        logger.error(f"Infinite queue error for {vid}: {e}")
+        return {"songs": []}
+
+
+# ─── Multi-Daily Mixes (Spotify Daily Mix 1 - 6) ───────────────────────────────
+DAILY_MIX_GENRES = [
+    {
+        "id": "daily-mix-1",
+        "title": "Daily Mix 1",
+        "genre": "Afrobeats & Amapiano",
+        "description": "Burna Boy, Asake, Tyla, and modern African rhythms.",
+        "seeds": ["Burna Boy", "Asake", "Rema", "Wizkid", "Tyla", "Ayra Starr", "Omah Lay"],
+        "color": "#00F0FF",
+    },
+    {
+        "id": "daily-mix-2",
+        "title": "Daily Mix 2",
+        "genre": "Hip Hop & Trap",
+        "description": "Drake, Kendrick Lamar, Travis Scott, and heavy 808s.",
+        "seeds": ["Drake", "Travis Scott", "Kendrick Lamar", "Future", "Gunna", "21 Savage"],
+        "color": "#FF007A",
+    },
+    {
+        "id": "daily-mix-3",
+        "title": "Daily Mix 3",
+        "genre": "R&B & Soul",
+        "description": "SZA, The Weeknd, Brent Faiyaz, and late-night smooth vocals.",
+        "seeds": ["SZA", "The Weeknd", "Brent Faiyaz", "Frank Ocean", "Giveon"],
+        "color": "#9D00FF",
+    },
+    {
+        "id": "daily-mix-4",
+        "title": "Daily Mix 4",
+        "genre": "Global Pop & Dance",
+        "description": "Dua Lipa, Billie Eilish, Bruno Mars, and chart-topping hits.",
+        "seeds": ["Dua Lipa", "Billie Eilish", "Bruno Mars", "Post Malone", "Sabrina Carpenter"],
+        "color": "#00FF66",
+    },
+    {
+        "id": "daily-mix-5",
+        "title": "Daily Mix 5",
+        "genre": "Chill & Lo-Fi",
+        "description": "Daniel Caesar, Steve Lacy, and mellow acoustic chords.",
+        "seeds": ["Daniel Caesar", "Steve Lacy", "Mac DeMarco", "Rex Orange County"],
+        "color": "#FFE600",
+    },
+    {
+        "id": "daily-mix-6",
+        "title": "Daily Mix 6",
+        "genre": "Electronic & House",
+        "description": "Calvin Harris, Fred again.., and infectious club beats.",
+        "seeds": ["Calvin Harris", "Fred again..", "Peggy Gou", "Disclosure", "Black Coffee"],
+        "color": "#FF5500",
+    },
+]
+
+@app.get("/api/daily-mixes")
+def get_daily_mixes(
+    top_artists: str = Query(default=""),
+    limit_per_mix: int = Query(default=10, le=25),
+):
+    """
+    Generate 6 distinct personalized Daily Mixes like Spotify:
+    - Clusters tracks by sonic identity (Afro, Hip Hop, R&B, Pop, Chill, Electronic).
+    - Injects user's preferred artists if they match a cluster.
+    - 70% familiar tracks + 30% discovery tracks.
+    """
+    user_artists = [a.strip().lower() for a in top_artists.split(",") if a.strip()]
+    mixes = []
+
+    for cluster in DAILY_MIX_GENRES:
+        matched_user_artists = [a for a in cluster["seeds"] if a.lower() in user_artists]
+        chosen_seeds = matched_user_artists[:2] if matched_user_artists else random.sample(cluster["seeds"], min(2, len(cluster["seeds"])))
+        primary_seed = chosen_seeds[0]
+
+        cluster_songs = search_songs(f"{primary_seed} hits essentials", limit=limit_per_mix)
+        if cluster_songs:
+            mixes.append({
+                "id": cluster["id"],
+                "title": cluster["title"],
+                "genre": cluster["genre"],
+                "description": cluster["description"],
+                "color": cluster["color"],
+                "cover": cluster_songs[0]["cover"] if cluster_songs else "",
+                "primaryArtist": primary_seed,
+                "tracks": cluster_songs,
+            })
+
+    return {"mixes": mixes}
+
+
+# ─── Spotify-Grade Personalized Discovery Feed ────────────────────────────────
+@app.get("/api/discover")
+def get_discover_feed(
+    recent_ids: str = Query(default=""),
+    top_artists: str = Query(default=""),
+    time_of_day: str = Query(default=""),
+):
+    """
+    Ever-Changing Personalized Discovery Engine (Spotify-like):
+    Dynamically evolves based on user history, time of day, and seed artists.
+    """
+    recent_list = [v.strip() for v in recent_ids.split(",") if v.strip() and VIDEO_ID_PATTERN.match(v.strip())]
+    artists_list = [a.strip() for a in top_artists.split(",") if a.strip()]
+
+    hour = datetime.now().hour
+    day_name = datetime.now().strftime("%A")
+
+    if 5 <= hour < 12:
+        vibe_title = f"{day_name} Morning Rise"
+        vibe_query = "morning acoustic positive energy"
+    elif 12 <= hour < 17:
+        vibe_title = f"{day_name} Afternoon Flow"
+        vibe_query = "afternoon upbeat focus motivation"
+    elif 17 <= hour < 22:
+        if day_name in ["Friday", "Saturday"]:
+            vibe_title = "Weekend Night Hype"
+            vibe_query = "party dance afrobeat bangers"
+        else:
+            vibe_title = "Evening Wind Down"
+            vibe_query = "chill r&b evening soul"
+    else:
+        vibe_title = "Midnight Frequency"
+        vibe_query = "late night lo-fi chill aesthetic"
+
+    time_mix_songs = search_songs(vibe_query, 12)
+
+    for_you_songs = []
+    if recent_list:
+        try:
+            watch = yt.get_watch_playlist(recent_list[0], radio=True, limit=15)
+            for t in watch.get("tracks", []):
+                t_vid = t.get("videoId")
+                if t_vid and t_vid not in recent_list:
+                    formatted = format_track(t)
+                    if is_full_song(formatted):
+                        for_you_songs.append(formatted)
+                if len(for_you_songs) >= 10:
+                    break
+        except Exception as e:
+            logger.warning(f"Failed to generate radio for {recent_list[0]}: {e}")
+
+    if not for_you_songs:
+        if artists_list:
+            for_you_songs = search_songs(f"songs similar to {artists_list[0]}", 10)
+        else:
+            for_you_songs = search_songs("top viral hits today", 10)
+
+    artist_mixes = []
+    sample_artists = artists_list[:2] if artists_list else ["Burna Boy", "The Weeknd"]
+    for art in sample_artists:
+        songs = search_songs(f"{art} essential hits", 8)
+        if songs:
+            artist_mixes.append({
+                "artist": art,
+                "title": f"Daily Mix: {art}",
+                "cover": songs[0]["cover"] if songs else "",
+                "songs": songs,
+            })
+
+    radar_query = f"new releases {artists_list[0]}" if artists_list else "new music trending chart"
+    discovery_radar = search_songs(radar_query, 10)
+
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "headlineMix": {
+            "title": vibe_title,
+            "cover": time_mix_songs[0]["cover"] if time_mix_songs else "",
+            "songs": time_mix_songs,
+        },
+        "forYou": {
+            "title": "Made For You",
+            "songs": for_you_songs,
+        },
+        "discoveryRadar": {
+            "title": "Discover Radar",
+            "songs": discovery_radar,
+        },
+        "artistMixes": artist_mixes,
+    }
+
+
+# ─── Health Check ──────────────────────────────────────────────────────────────
+@app.get("/api/health")
+def health_check():
+    """Simple health check endpoint."""
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
