@@ -263,8 +263,8 @@ def _validate_video_id(video_id: str) -> str:
     return vid
 
 
-def _extract_audio_url(video_id: str) -> tuple[str, str, int]:
-    """Try multiple yt-dlp player client strategies to extract a direct audio URL."""
+def _extract_audio_url(video_id: str, query_hint: str = "") -> tuple[str, str, int]:
+    """Try multiple yt-dlp player client strategies to extract a direct audio URL, with fallback search."""
     url = f"https://www.youtube.com/watch?v={video_id}"
     last_error = None
 
@@ -294,6 +294,31 @@ def _extract_audio_url(video_id: str) -> tuple[str, str, int]:
             last_error = e
             logger.warning(f"yt-dlp extract failed with clients={clients}: {e}")
             continue
+
+    # Fallback: If direct video ID extraction failed (e.g. music video unavailable or geoblocked), search by hint
+    if query_hint:
+        logger.info(f"Direct extract failed for {video_id}. Attempting search fallback with hint: '{query_hint}'")
+        try:
+            search_opts = {
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "http_headers": YDL_HEADERS,
+                "socket_timeout": 30,
+            }
+            with yt_dlp.YoutubeDL(search_opts) as ydl:
+                search_info = ydl.extract_info(f"ytsearch1:{query_hint} audio", download=False)
+                if search_info and "entries" in search_info and search_info["entries"]:
+                    entry = search_info["entries"][0]
+                    audio_url = entry.get("url")
+                    title = entry.get("title", "audio")
+                    duration = entry.get("duration", 0)
+                    if audio_url:
+                        logger.info(f"Search fallback succeeded for {video_id} -> {entry.get('id')} ({title})")
+                        return audio_url, title, duration
+        except Exception as fallback_err:
+            logger.warning(f"Fallback search failed for '{query_hint}': {fallback_err}")
 
     raise last_error or Exception("All extraction strategies failed")
 
@@ -444,19 +469,24 @@ def search_suggestions(q: str = ""):
 
 # ─── Audio URL (NEW — for Expo native playback) ───────────────────────────────
 @app.get("/api/audio-url/{video_id}")
-def get_audio_url(video_id: str):
-    """Returns a direct audio stream URL for native playback (expo-av)."""
+def get_audio_url(
+    video_id: str,
+    title: Optional[str] = Query(None),
+    artist: Optional[str] = Query(None),
+):
+    """Returns a direct audio stream URL for native playback (expo-av / expo-audio)."""
     vid = _validate_video_id(video_id)
+    hint = f"{artist or ''} {title or ''}".strip()
     try:
-        audio_url, title, duration = _extract_audio_url(vid)
+        audio_url, extracted_title, duration = _extract_audio_url(vid, query_hint=hint)
         return {
             "videoId": vid,
             "audioUrl": audio_url,
-            "title": title,
+            "title": extracted_title or title or "audio",
             "duration": duration,
         }
     except Exception as e:
-        logger.error(f"Audio URL extraction failed for {vid}: {e}")
+        logger.error(f"Audio URL extraction failed for {vid} (hint='{hint}'): {e}")
         raise HTTPException(status_code=502, detail="Failed to extract audio URL")
 
 
