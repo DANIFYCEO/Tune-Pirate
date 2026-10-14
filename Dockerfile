@@ -1,8 +1,9 @@
 FROM python:3.10-slim
 
-# Install ffmpeg and nodejs (for yt-dlp JS runtime)
+# Install ffmpeg and Deno for yt-dlp's YouTube challenge solver.
 RUN apt-get update && \
-    apt-get install -y ffmpeg nodejs && \
+    apt-get install -y --no-install-recommends ffmpeg curl unzip && \
+    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
