@@ -264,20 +264,22 @@ def _validate_video_id(video_id: str) -> str:
 
 
 def _extract_audio_url(video_id: str, query_hint: str = "") -> tuple[str, str, int]:
-    """Try multiple yt-dlp player client strategies to extract a direct audio URL, with fallback search."""
+    """Rapidly extract a direct audio URL using fast direct client with instant ytsearch fallback."""
     url = f"https://www.youtube.com/watch?v={video_id}"
     last_error = None
 
-    for clients in YDL_CLIENT_STRATEGIES:
+    # Try fast direct extraction first (max 5s timeout)
+    fast_strategies = [["android"], ["ios"], []]
+    for clients in fast_strategies:
         ydl_opts = {
             "format": "bestaudio[ext=m4a]/bestaudio/best",
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
             "http_headers": YDL_HEADERS,
-            "socket_timeout": 30,
-            "retries": 3,
-            "fragment_retries": 3,
+            "socket_timeout": 5,
+            "retries": 1,
+            "fragment_retries": 1,
         }
         if clients:
             ydl_opts["extractor_args"] = {"youtube": {"player_client": clients}}
@@ -292,12 +294,22 @@ def _extract_audio_url(video_id: str, query_hint: str = "") -> tuple[str, str, i
                     return audio_url, title, duration
         except Exception as e:
             last_error = e
-            logger.warning(f"yt-dlp extract failed with clients={clients}: {e}")
-            continue
+            logger.debug(f"Direct yt-dlp extract failed for {video_id} (clients={clients}): {e}")
+            break  # Break early to trigger instant search fallback
 
-    # Fallback: If direct video ID extraction failed (e.g. music video unavailable or geoblocked), search by hint
-    if query_hint:
-        logger.info(f"Direct extract failed for {video_id}. Attempting search fallback with hint: '{query_hint}'")
+    # If direct extract failed, resolve query hint if not provided
+    hint = (query_hint or "").strip()
+    if not hint:
+        try:
+            meta = yt.get_song(video_id)
+            details = meta.get("videoDetails", {})
+            hint = f"{details.get('author', '')} {details.get('title', '')}".strip()
+        except Exception:
+            pass
+
+    # Instant Fallback: Search for high-fidelity audio version by title/artist
+    if hint:
+        logger.info(f"Direct extract failed for {video_id}. Instant search fallback with hint: '{hint}'")
         try:
             search_opts = {
                 "format": "bestaudio[ext=m4a]/bestaudio/best",
@@ -305,10 +317,11 @@ def _extract_audio_url(video_id: str, query_hint: str = "") -> tuple[str, str, i
                 "no_warnings": True,
                 "skip_download": True,
                 "http_headers": YDL_HEADERS,
-                "socket_timeout": 30,
+                "socket_timeout": 8,
+                "retries": 1,
             }
             with yt_dlp.YoutubeDL(search_opts) as ydl:
-                search_info = ydl.extract_info(f"ytsearch1:{query_hint} audio", download=False)
+                search_info = ydl.extract_info(f"ytsearch1:{hint} audio", download=False)
                 if search_info and "entries" in search_info and search_info["entries"]:
                     entry = search_info["entries"][0]
                     audio_url = entry.get("url")
@@ -318,9 +331,9 @@ def _extract_audio_url(video_id: str, query_hint: str = "") -> tuple[str, str, i
                         logger.info(f"Search fallback succeeded for {video_id} -> {entry.get('id')} ({title})")
                         return audio_url, title, duration
         except Exception as fallback_err:
-            logger.warning(f"Fallback search failed for '{query_hint}': {fallback_err}")
+            logger.warning(f"Fallback search failed for '{hint}': {fallback_err}")
 
-    raise last_error or Exception("All extraction strategies failed")
+    raise last_error or Exception("All audio extraction strategies failed")
 
 
 # Shared httpx client for connection reuse
