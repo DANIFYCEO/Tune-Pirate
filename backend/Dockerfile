@@ -1,11 +1,14 @@
+FROM denoland/deno:bin-2.9.7 AS deno-runtime
+
 FROM python:3.10-slim
 
-# Install ffmpeg and Deno for yt-dlp's YouTube challenge solver.
+# Install ffmpeg and copy the supported Deno runtime for yt-dlp.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg curl unzip && \
-    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
+    apt-get install -y --no-install-recommends ffmpeg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+COPY --from=deno-runtime /deno /usr/local/bin/deno
 
 WORKDIR /app
 

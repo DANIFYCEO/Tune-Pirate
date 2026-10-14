@@ -32,4 +32,6 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ghcr.io/danifyceo/tunepirate-backend:latest
+          tags: |
+            ghcr.io/danifyceo/tunepirate-backend:latest
+            ghcr.io/danifyceo/tunepirate-backend:${{ github.sha }}
