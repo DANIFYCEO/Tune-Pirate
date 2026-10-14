@@ -1,0 +1,13 @@
+.git
+.github
+node_modules
+frontend
+frontend-rn
+Screens
+stitch_tune_pirate_music_app
+*.b64
+*.png
+*.jpg
+__pycache__
+*.pyc
+.env*
