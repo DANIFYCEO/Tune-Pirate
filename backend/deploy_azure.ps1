@@ -2,8 +2,8 @@
 # Uses Azure Container Apps Free Grant (180,000 vCPU-seconds and 2 million requests/month free)
 
 param(
-    [string]$ResourceGroup = "TunePirate-RG",
-    [string]$Location = "eastus",
+    [string]$ResourceGroup = "TunePirate-App-RG",
+    [string]$Location = "polandcentral",
     [string]$AppName = "tunepirate-api",
     [string]$AcrName = "tunepiratecr$((Get-Random -Minimum 1000 -Maximum 9999))"
 )

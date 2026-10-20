@@ -3,19 +3,23 @@ Tune Pirate Backend — FastAPI
 Provides music search, streaming, downloads, and discovery via YouTube Music.
 """
 
+import base64
 import difflib
 import logging
+import os
 import random
 import re
+import tempfile
 import time
 from datetime import datetime
 from functools import wraps
 from typing import Optional
+from urllib.parse import quote
 
 import asyncio
 import httpx
 import yt_dlp
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
@@ -237,22 +241,88 @@ def search_songs(query: str, limit: int = 8, allow_long: bool = False) -> list[d
 
 # ─── yt-dlp Audio Extraction ──────────────────────────────────────────────────
 YDL_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.youtube.com/",
 }
 
-YDL_CLIENT_STRATEGIES = [
-    ["android"],
-    ["ios"],
-    ["web_creator"],
-    ["mweb"],
-    ["web", "web_creator"],
-    [],
-]
-
 VIDEO_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+
+# In-memory stream URL cache: video_id -> (timestamp, audio_url, title, duration)
+# YouTube googlevideo URLs stay valid for ~6 hours; we cache for 4 hours (14400s)
+_stream_cache: dict[str, tuple[float, str, str, int]] = {}
+STREAM_CACHE_TTL = 14400
+
+_cookie_file_path: Optional[str] = None
+
+
+def _get_cookie_file() -> Optional[str]:
+    """
+    Returns path to a valid Netscape cookies file if available.
+    Supports:
+    1. YOUTUBE_COOKIES_FILE env var
+    2. Local cookies.txt in backend or project directory
+    3. YOUTUBE_COOKIES_B64 env var (base64-encoded Netscape cookie file)
+    4. YOUTUBE_COOKIES env var (raw Netscape cookies text)
+    """
+    global _cookie_file_path
+    if _cookie_file_path and os.path.exists(_cookie_file_path) and os.path.getsize(_cookie_file_path) > 10:
+        return _cookie_file_path
+
+    env_file = os.environ.get("YOUTUBE_COOKIES_FILE")
+    if env_file and os.path.exists(env_file) and os.path.getsize(env_file) > 10:
+        _cookie_file_path = env_file
+        return _cookie_file_path
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, "cookies.txt"),
+        os.path.abspath("cookies.txt"),
+        os.path.abspath("backend/cookies.txt"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 10:
+            logger.info(f"Using local YouTube cookie file: {candidate}")
+            _cookie_file_path = candidate
+            return _cookie_file_path
+
+    b64_content = os.environ.get("YOUTUBE_COOKIES_B64")
+    if b64_content:
+        try:
+            decoded = base64.b64decode(b64_content.strip()).decode("utf-8", errors="ignore")
+            target = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(decoded)
+            logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES_B64 -> {target} ({len(decoded)} bytes)")
+            _cookie_file_path = target
+            return _cookie_file_path
+        except Exception as e:
+            logger.error(f"Failed to decode YOUTUBE_COOKIES_B64: {e}")
+
+    raw_content = os.environ.get("YOUTUBE_COOKIES")
+    if raw_content and len(raw_content.strip()) > 10:
+        try:
+            target = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(raw_content.strip())
+            logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES -> {target}")
+            _cookie_file_path = target
+            return _cookie_file_path
+        except Exception as e:
+            logger.error(f"Failed to write YOUTUBE_COOKIES: {e}")
+
+    return None
+
+
+def _get_base_url(request: Request) -> str:
+    """Determine the public base URL of the API for proxy link generation."""
+    env_public = os.environ.get("PUBLIC_API_URL", "").strip().rstrip("/")
+    if env_public:
+        return env_public
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
+    return f"{proto}://{host}".rstrip("/")
 
 
 def _validate_video_id(video_id: str) -> str:
@@ -263,13 +333,26 @@ def _validate_video_id(video_id: str) -> str:
     return vid
 
 
-def _extract_audio_url(video_id: str, query_hint: str = "") -> tuple[str, str, int]:
+def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool = False) -> tuple[str, str, int]:
     """Rapidly extract a direct audio URL using fast direct client with instant ytsearch fallback."""
+    now = time.time()
+    if not force_refresh and video_id in _stream_cache:
+        ts, cached_url, cached_title, cached_dur = _stream_cache[video_id]
+        if now - ts < STREAM_CACHE_TTL:
+            return cached_url, cached_title, cached_dur
+
     url = f"https://www.youtube.com/watch?v={video_id}"
+    cookie_path = _get_cookie_file()
+    po_token = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
+
+    # If cookies are provided, prioritize web/ios clients where cookies are most effective
+    if cookie_path:
+        fast_strategies = [["web"], ["ios"], ["android"], []]
+    else:
+        fast_strategies = [["android"], ["ios"], []]
+
     last_error = None
 
-    # Try fast direct extraction first (max 5s timeout)
-    fast_strategies = [["android"], ["ios"], []]
     for clients in fast_strategies:
         ydl_opts = {
             "format": "bestaudio[ext=m4a]/bestaudio/best",
@@ -277,12 +360,20 @@ def _extract_audio_url(video_id: str, query_hint: str = "") -> tuple[str, str, i
             "no_warnings": True,
             "skip_download": True,
             "http_headers": YDL_HEADERS,
-            "socket_timeout": 5,
+            "socket_timeout": 6,
             "retries": 1,
             "fragment_retries": 1,
         }
+        if cookie_path and os.path.exists(cookie_path):
+            ydl_opts["cookiefile"] = cookie_path
+
+        extractor_youtube = {}
         if clients:
-            ydl_opts["extractor_args"] = {"youtube": {"player_client": clients}}
+            extractor_youtube["player_client"] = clients
+        if po_token:
+            extractor_youtube["po_token"] = [po_token if "+" in po_token else f"web+{po_token}"]
+        if extractor_youtube:
+            ydl_opts["extractor_args"] = {"youtube": extractor_youtube}
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -291,11 +382,13 @@ def _extract_audio_url(video_id: str, query_hint: str = "") -> tuple[str, str, i
                 title = info.get("title", "audio")
                 duration = info.get("duration", 0)
                 if audio_url:
+                    _stream_cache[video_id] = (time.time(), audio_url, title, duration)
                     return audio_url, title, duration
         except Exception as e:
             last_error = e
             logger.debug(f"Direct yt-dlp extract failed for {video_id} (clients={clients}): {e}")
-            break  # Break early to trigger instant search fallback
+            if not cookie_path:
+                break  # Break early to trigger instant search fallback
 
     # If direct extract failed, resolve query hint if not provided
     hint = (query_hint or "").strip()
@@ -320,6 +413,13 @@ def _extract_audio_url(video_id: str, query_hint: str = "") -> tuple[str, str, i
                 "socket_timeout": 8,
                 "retries": 1,
             }
+            if cookie_path and os.path.exists(cookie_path):
+                search_opts["cookiefile"] = cookie_path
+            if po_token:
+                search_opts["extractor_args"] = {
+                    "youtube": {"po_token": [po_token if "+" in po_token else f"web+{po_token}"]}
+                }
+
             with yt_dlp.YoutubeDL(search_opts) as ydl:
                 search_info = ydl.extract_info(f"ytsearch1:{hint} audio", download=False)
                 if search_info and "entries" in search_info and search_info["entries"]:
@@ -329,6 +429,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "") -> tuple[str, str, i
                     duration = entry.get("duration", 0)
                     if audio_url:
                         logger.info(f"Search fallback succeeded for {video_id} -> {entry.get('id')} ({title})")
+                        _stream_cache[video_id] = (time.time(), audio_url, title, duration)
                         return audio_url, title, duration
         except Exception as fallback_err:
             logger.warning(f"Fallback search failed for '{hint}': {fallback_err}")
@@ -342,7 +443,9 @@ _http_client: Optional[httpx.AsyncClient] = None
 async def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+        # read=None allows infinite streaming without timing out mid-song
+        timeout = httpx.Timeout(connect=10.0, read=None, write=15.0, pool=15.0)
+        _http_client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
     return _http_client
 
 @app.on_event("shutdown")
@@ -480,23 +583,146 @@ def search_suggestions(q: str = ""):
         return {"query": q, "suggestions": []}
 
 
+# ─── Audio Stream Proxy (HTTP Range support for native mobile buffering) ──────
+@app.api_route("/api/stream-proxy/{video_id}", methods=["GET", "HEAD"])
+async def stream_audio_proxy(
+    video_id: str,
+    request: Request,
+    title: Optional[str] = Query(None),
+    artist: Optional[str] = Query(None),
+):
+    """
+    Streaming audio proxy with HTTP Range support (RFC 7233).
+    Bypasses YouTube's IP-bound googlevideo.com URLs and datacenter IP blocks,
+    enabling native mobile players (expo-av, ExoPlayer, AVPlayer) to buffer and seek.
+    """
+    vid = _validate_video_id(video_id)
+    hint = f"{artist or ''} {title or ''}".strip()
+
+    # 1. Resolve audio stream URL
+    try:
+        audio_url, _, _ = _extract_audio_url(vid, query_hint=hint)
+    except Exception as e:
+        logger.error(f"Stream proxy failed to extract audio for {vid}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to extract audio stream")
+
+    client = await _get_http_client()
+
+    # Forward client's Range header if present
+    req_headers = {
+        "User-Agent": YDL_HEADERS["User-Agent"],
+        "Accept": "*/*",
+        "Referer": "https://www.youtube.com/",
+    }
+    range_header = request.headers.get("range")
+    if range_header:
+        req_headers["Range"] = range_header
+
+    # Helper to send request to upstream googlevideo
+    async def _send_upstream(url: str):
+        upstream_req = client.build_request("GET", url, headers=req_headers)
+        return await client.send(upstream_req, stream=True)
+
+    try:
+        upstream_resp = await _send_upstream(audio_url)
+    except Exception as e:
+        logger.warning(f"Upstream stream connection error for {vid}: {e}. Retrying fresh extraction...")
+        _stream_cache.pop(vid, None)
+        audio_url, _, _ = _extract_audio_url(vid, query_hint=hint, force_refresh=True)
+        upstream_resp = await _send_upstream(audio_url)
+
+    # If YouTube returns 403 Forbidden (URL expired or IP mismatch), invalidate cache and re-extract once
+    if upstream_resp.status_code in (403, 410):
+        await upstream_resp.aclose()
+        logger.warning(f"Upstream returned {upstream_resp.status_code} for {vid}. Re-extracting fresh URL...")
+        _stream_cache.pop(vid, None)
+        try:
+            audio_url, _, _ = _extract_audio_url(vid, query_hint=hint, force_refresh=True)
+            upstream_resp = await _send_upstream(audio_url)
+        except Exception as retry_err:
+            logger.error(f"Re-extraction retry failed for {vid}: {retry_err}")
+            raise HTTPException(status_code=502, detail="Upstream audio stream unavailable")
+
+    # If still not 200 or 206, close and raise
+    if upstream_resp.status_code not in (200, 206):
+        status = upstream_resp.status_code
+        await upstream_resp.aclose()
+        logger.error(f"Upstream returned error {status} for {vid}")
+        raise HTTPException(status_code=status if status < 500 else 502, detail="Upstream audio stream error")
+
+    # Build response headers to stream back to client
+    resp_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=14400",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+    }
+    for h in ("Content-Type", "Content-Length", "Content-Range"):
+        val = upstream_resp.headers.get(h)
+        if val:
+            resp_headers[h] = val
+
+    if "Content-Type" not in resp_headers:
+        resp_headers["Content-Type"] = "audio/mp4"
+
+    # If HEAD request, return headers immediately without streaming body
+    if request.method == "HEAD":
+        await upstream_resp.aclose()
+        return Response(status_code=upstream_resp.status_code, headers=resp_headers)
+
+    async def _body_streamer():
+        try:
+            async for chunk in upstream_resp.aiter_bytes(chunk_size=65536):
+                yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            # Client disconnected / stopped playback — clean exit
+            pass
+        except Exception as stream_err:
+            logger.debug(f"Stream interrupted for {vid}: {stream_err}")
+        finally:
+            await upstream_resp.aclose()
+
+    return StreamingResponse(
+        _body_streamer(),
+        status_code=upstream_resp.status_code,
+        headers=resp_headers,
+    )
+
+
 # ─── Audio URL (NEW — for Expo native playback) ───────────────────────────────
 @app.get("/api/audio-url/{video_id}")
 def get_audio_url(
     video_id: str,
+    request: Request,
     title: Optional[str] = Query(None),
     artist: Optional[str] = Query(None),
+    direct: bool = Query(False),
 ):
-    """Returns a direct audio stream URL for native playback (expo-av / expo-audio)."""
+    """Returns an audio stream URL for native playback (expo-av / expo-audio).
+    By default returns the streaming proxy URL to avoid googlevideo IP-binding 403s.
+    """
     vid = _validate_video_id(video_id)
     hint = f"{artist or ''} {title or ''}".strip()
     try:
         audio_url, extracted_title, duration = _extract_audio_url(vid, query_hint=hint)
+        base_url = _get_base_url(request)
+
+        params = []
+        if title:
+            params.append(f"title={quote(title)}")
+        if artist:
+            params.append(f"artist={quote(artist)}")
+        qs = f"?{'&'.join(params)}" if params else ""
+
+        proxy_url = f"{base_url}/api/stream-proxy/{vid}{qs}"
+
         return {
             "videoId": vid,
-            "audioUrl": audio_url,
+            "audioUrl": audio_url if direct else proxy_url,
+            "directAudioUrl": audio_url,
             "title": extracted_title or title or "audio",
             "duration": duration,
+            "proxied": not direct,
         }
     except Exception as e:
         logger.error(f"Audio URL extraction failed for {vid} (hint='{hint}'): {e}")
