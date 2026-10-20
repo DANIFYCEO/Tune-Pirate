@@ -9,6 +9,8 @@ backend/venv/
 backend/__pycache__/
 backend/ffmpeg_bin/
 backend/*.pyc
+*cookies*.txt
+cookies.txt
 
 # OS
 .DS_Store
