@@ -257,6 +257,24 @@ STREAM_CACHE_TTL = 14400
 _cookie_file_path: Optional[str] = None
 
 
+def _sanitize_cookies(content: str) -> str:
+    """Filter out personal account session cookies (SID, SSID, etc.) that cause
+    Google's Device Bound Session Credentials (DBSC) to revoke the session across continents.
+    Keeps visitor provenance cookies (VISITOR_INFO1_LIVE, PREF, SOCS, etc.).
+    """
+    clean_lines = ["# Netscape HTTP Cookie File\n"]
+    for line in content.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            name = parts[5]
+            if any(bad in name for bad in ["SID", "SSID", "APISID", "SAPISID"]):
+                continue
+            clean_lines.append(line + "\n")
+    return "".join(clean_lines) if len(clean_lines) > 1 else content
+
+
 def _get_cookie_file() -> Optional[str]:
     """
     Returns path to a valid Netscape cookies file if available.
@@ -291,10 +309,11 @@ def _get_cookie_file() -> Optional[str]:
     if b64_content:
         try:
             decoded = base64.b64decode(b64_content.strip()).decode("utf-8", errors="ignore")
+            sanitized = _sanitize_cookies(decoded)
             target = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
             with open(target, "w", encoding="utf-8") as f:
-                f.write(decoded)
-            logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES_B64 -> {target} ({len(decoded)} bytes)")
+                f.write(sanitized)
+            logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES_B64 -> {target} ({len(sanitized)} bytes)")
             _cookie_file_path = target
             return _cookie_file_path
         except Exception as e:
@@ -303,9 +322,10 @@ def _get_cookie_file() -> Optional[str]:
     raw_content = os.environ.get("YOUTUBE_COOKIES")
     if raw_content and len(raw_content.strip()) > 10:
         try:
+            sanitized = _sanitize_cookies(raw_content.strip())
             target = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
             with open(target, "w", encoding="utf-8") as f:
-                f.write(raw_content.strip())
+                f.write(sanitized)
             logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES -> {target}")
             _cookie_file_path = target
             return _cookie_file_path
@@ -349,8 +369,13 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
     # (AAC audio, itag 18) if YouTube enables SABR streaming on audio-only itags.
     format_selector = "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best"
 
-    # Android client is prioritized because it extracts format 18/140 without web bot blocks
-    fast_strategies = [["android"], ["ios"], ["web"], []]
+    # Prioritized client strategies:
+    # 1. Android player (extracts clean mp4/aac formats without web bot challenges)
+    # 2. Android Music player
+    # 3. iOS player
+    # 4. Mobile web (mweb)
+    # 5. Default web client
+    fast_strategies = [["android"], ["android_music"], ["ios"], ["mweb"], []]
     last_error = None
 
     # Try extraction (first with cookies if available, and if invalid/failed, without cookies)
@@ -358,17 +383,21 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
 
     for current_cookie in cookie_options:
         for clients in fast_strategies:
+            is_mobile = any(c in ("android", "android_music", "ios") for c in clients)
             ydl_opts = {
                 "format": format_selector,
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
-                "http_headers": YDL_HEADERS,
-                "socket_timeout": 6,
+                "socket_timeout": 15,
                 "retries": 1,
                 "fragment_retries": 1,
                 "js_runtimes": {"node": {}},
             }
+            # Only add desktop browser headers when NOT spoofing a mobile client
+            if not is_mobile:
+                ydl_opts["http_headers"] = YDL_HEADERS
+
             if current_cookie and os.path.exists(current_cookie):
                 ydl_opts["cookiefile"] = current_cookie
 
@@ -391,7 +420,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
                         return audio_url, title, duration
             except Exception as e:
                 last_error = e
-                logger.debug(f"Direct yt-dlp extract failed for {video_id} (clients={clients}, cookie={bool(current_cookie)}): {e}")
+                logger.info(f"Direct yt-dlp extract failed for {video_id} (clients={clients}, cookie={bool(current_cookie)}): {e}")
 
     # If direct extract failed, resolve query hint if not provided
     hint = (query_hint or "").strip()
@@ -407,38 +436,44 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
     if hint:
         logger.info(f"Direct extract failed for {video_id}. Instant search fallback with hint: '{hint}'")
         for current_cookie in cookie_options:
-            try:
-                search_opts = {
-                    "format": format_selector,
-                    "quiet": True,
-                    "no_warnings": True,
-                    "skip_download": True,
-                    "http_headers": YDL_HEADERS,
-                    "socket_timeout": 8,
-                    "retries": 1,
-                    "js_runtimes": {"node": {}},
-                    "extractor_args": {"youtube": {"player_client": ["android"]}},
-                }
-                if current_cookie and os.path.exists(current_cookie):
-                    search_opts["cookiefile"] = current_cookie
-                if po_token:
-                    search_opts["extractor_args"]["youtube"]["po_token"] = [
-                        po_token if "+" in po_token else f"web+{po_token}"
-                    ]
+            for fallback_client in [["android"], []]:
+                try:
+                    search_opts = {
+                        "format": format_selector,
+                        "quiet": True,
+                        "no_warnings": True,
+                        "skip_download": True,
+                        "socket_timeout": 15,
+                        "retries": 1,
+                        "js_runtimes": {"node": {}},
+                    }
+                    if fallback_client:
+                        search_opts["extractor_args"] = {"youtube": {"player_client": fallback_client}}
+                    else:
+                        search_opts["http_headers"] = YDL_HEADERS
 
-                with yt_dlp.YoutubeDL(search_opts) as ydl:
-                    search_info = ydl.extract_info(f"ytsearch1:{hint} audio", download=False)
-                    if search_info and "entries" in search_info and search_info["entries"]:
-                        entry = search_info["entries"][0]
-                        audio_url = entry.get("url")
-                        title = entry.get("title", "audio")
-                        duration = entry.get("duration", 0)
-                        if audio_url:
-                            logger.info(f"Search fallback succeeded for {video_id} -> {entry.get('id')} ({title})")
-                            _stream_cache[video_id] = (time.time(), audio_url, title, duration)
-                            return audio_url, title, duration
-            except Exception as fallback_err:
-                logger.warning(f"Fallback search failed for '{hint}' (cookie={bool(current_cookie)}): {fallback_err}")
+                    if current_cookie and os.path.exists(current_cookie):
+                        search_opts["cookiefile"] = current_cookie
+                    if po_token:
+                        if "extractor_args" not in search_opts:
+                            search_opts["extractor_args"] = {"youtube": {}}
+                        search_opts["extractor_args"]["youtube"]["po_token"] = [
+                            po_token if "+" in po_token else f"web+{po_token}"
+                        ]
+
+                    with yt_dlp.YoutubeDL(search_opts) as ydl:
+                        search_info = ydl.extract_info(f"ytsearch1:{hint} audio", download=False)
+                        if search_info and "entries" in search_info and search_info["entries"]:
+                            entry = search_info["entries"][0]
+                            audio_url = entry.get("url")
+                            title = entry.get("title", "audio")
+                            duration = entry.get("duration", 0)
+                            if audio_url:
+                                logger.info(f"Search fallback succeeded for {video_id} -> {entry.get('id')} ({title})")
+                                _stream_cache[video_id] = (time.time(), audio_url, title, duration)
+                                return audio_url, title, duration
+                except Exception as fallback_err:
+                    logger.warning(f"Fallback search failed for '{hint}' (clients={fallback_client}, cookie={bool(current_cookie)}): {fallback_err}")
 
     raise last_error or Exception("All audio extraction strategies failed")
 
@@ -733,6 +768,53 @@ def get_audio_url(
     except Exception as e:
         logger.error(f"Audio URL extraction failed for {vid} (hint='{hint}'): {e}")
         raise HTTPException(status_code=502, detail="Failed to extract audio URL")
+
+
+@app.get("/api/debug/extract/{video_id}")
+def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Optional[str] = Query(None)):
+    """Diagnostic endpoint to inspect extraction behavior directly on Azure."""
+    results = {"video_id": video_id}
+    cookie_file = _get_cookie_file()
+    results["cookie_file"] = cookie_file
+    results["cookie_exists"] = bool(cookie_file and os.path.exists(cookie_file))
+    if results["cookie_exists"]:
+        results["cookie_size"] = os.path.getsize(cookie_file)
+        try:
+            with open(cookie_file, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+                results["cookie_count"] = len(lines)
+                results["cookie_names"] = [l.split("\t")[5] for l in lines if len(l.split("\t")) >= 6]
+        except Exception as ce:
+            results["cookie_read_error"] = str(ce)
+
+    for client in ["android", "android_music", "mweb", "ios", "web"]:
+        try:
+            ydl_opts = {
+                "format": "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best",
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "socket_timeout": 12,
+                "extractor_args": {"youtube": {"player_client": [client]}},
+            }
+            if client not in ("android", "android_music", "ios"):
+                ydl_opts["http_headers"] = YDL_HEADERS
+            if cookie_file and os.path.exists(cookie_file):
+                ydl_opts["cookiefile"] = cookie_file
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                results[client] = {
+                    "success": True,
+                    "url": (info.get("url") or "")[:70] + "...",
+                    "format_id": info.get("format_id"),
+                    "ext": info.get("ext"),
+                }
+        except Exception as e:
+            results[client] = {
+                "success": False,
+                "error": str(e),
+            }
+    return results
 
 
 # ─── Stream URL (kept for backward compat) ────────────────────────────────────
