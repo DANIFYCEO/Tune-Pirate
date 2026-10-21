@@ -367,6 +367,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
                 "socket_timeout": 6,
                 "retries": 1,
                 "fragment_retries": 1,
+                "js_runtimes": {"node": {}},
             }
             if current_cookie and os.path.exists(current_cookie):
                 ydl_opts["cookiefile"] = current_cookie
@@ -415,6 +416,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
                     "http_headers": YDL_HEADERS,
                     "socket_timeout": 8,
                     "retries": 1,
+                    "js_runtimes": {"node": {}},
                     "extractor_args": {"youtube": {"player_client": ["android"]}},
                 }
                 if current_cookie and os.path.exists(current_cookie):

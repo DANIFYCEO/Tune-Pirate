@@ -1,14 +1,10 @@
-FROM denoland/deno:bin-2.9.7 AS deno-runtime
+FROM python:3.11-slim
 
-FROM python:3.10-slim
-
-# Install ffmpeg and copy the supported Deno runtime for yt-dlp.
+# Install ffmpeg and Node.js for yt-dlp JavaScript challenge deciphering
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg nodejs && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
-
-COPY --from=deno-runtime /deno /usr/local/bin/deno
 
 WORKDIR /app
 

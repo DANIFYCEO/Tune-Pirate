@@ -1,14 +1,9 @@
 import { Platform } from 'react-native';
 
-// Azure Container Apps live production backend in Poland Central
+// Azure Container Apps live production backend
 const AZURE_URL = 'https://tunepirate-live.happyflower-25695355.polandcentral.azurecontainerapps.io';
 
-// Optional local LAN fallback for offline development
-const LAN_IP = '192.168.1.217';
-
-const DEFAULT_URL = AZURE_URL;
-
-export const API_BASE = DEFAULT_URL;
+export const API_BASE = AZURE_URL;
 
 async function request(endpoint, options = {}) {
   try {
