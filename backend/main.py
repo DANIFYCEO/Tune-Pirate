@@ -257,24 +257,6 @@ STREAM_CACHE_TTL = 14400
 _cookie_file_path: Optional[str] = None
 
 
-def _sanitize_cookies(content: str) -> str:
-    """Filter out personal account session cookies (SID, SSID, etc.) that cause
-    Google's Device Bound Session Credentials (DBSC) to revoke the session across continents.
-    Keeps visitor provenance cookies (VISITOR_INFO1_LIVE, PREF, SOCS, etc.).
-    """
-    clean_lines = ["# Netscape HTTP Cookie File\n"]
-    for line in content.splitlines():
-        if not line.strip() or line.startswith("#"):
-            continue
-        parts = line.split("\t")
-        if len(parts) >= 7:
-            name = parts[5]
-            if any(bad in name for bad in ["SID", "SSID", "APISID", "SAPISID"]):
-                continue
-            clean_lines.append(line + "\n")
-    return "".join(clean_lines) if len(clean_lines) > 1 else content
-
-
 def _get_cookie_file() -> Optional[str]:
     """
     Returns path to a valid Netscape cookies file if available.
@@ -309,11 +291,10 @@ def _get_cookie_file() -> Optional[str]:
     if b64_content:
         try:
             decoded = base64.b64decode(b64_content.strip()).decode("utf-8", errors="ignore")
-            sanitized = _sanitize_cookies(decoded)
             target = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
             with open(target, "w", encoding="utf-8") as f:
-                f.write(sanitized)
-            logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES_B64 -> {target} ({len(sanitized)} bytes)")
+                f.write(decoded)
+            logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES_B64 -> {target} ({len(decoded)} bytes)")
             _cookie_file_path = target
             return _cookie_file_path
         except Exception as e:
@@ -322,10 +303,9 @@ def _get_cookie_file() -> Optional[str]:
     raw_content = os.environ.get("YOUTUBE_COOKIES")
     if raw_content and len(raw_content.strip()) > 10:
         try:
-            sanitized = _sanitize_cookies(raw_content.strip())
             target = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
             with open(target, "w", encoding="utf-8") as f:
-                f.write(sanitized)
+                f.write(raw_content.strip())
             logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES -> {target}")
             _cookie_file_path = target
             return _cookie_file_path
