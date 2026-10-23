@@ -860,7 +860,7 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
         results["pot_provider_status"] = str(pe)
 
     # Check formats available with default client
-    results["pot_plugins_found"] = os.path.exists("/app/yt_dlp_plugins") or os.path.exists("/pot/yt_dlp_plugins")
+    results["pot_plugins_found"] = os.path.exists("/app/yt_dlp_plugins") or os.path.exists("/pot/plugin/yt_dlp_plugins")
     try:
         ydl_opts_all = {
             "quiet": True,
