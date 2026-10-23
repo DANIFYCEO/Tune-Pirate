@@ -359,7 +359,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
         if now - ts < STREAM_CACHE_TTL:
             return cached_url, cached_title, cached_dur
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
+    url = f"https://music.youtube.com/watch?v={video_id}"
     cookie_path = _get_cookie_file()
     po_token = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
 
@@ -368,12 +368,12 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
     format_selector = "bestaudio/best"
 
     # Prioritized client strategies:
-    # 1. Android VR (extracts format 251 Opus audio cleanly when passed session cookies)
-    # 2. Web client (uses bgutil-ytdlp-pot-provider on 127.0.0.1:4416 + cookies)
+    # 1. Default (native YouTube Music extractor - fastest, no bot blocks)
+    # 2. Web client (uses bgutil-ytdlp-pot-provider on 127.0.0.1:4416)
     # 3. Mobile web (mweb)
-    # 4. Default player
-    # 5. Android player (without cookies)
-    fast_strategies = [["web"], ["mweb"], ["android_vr"], [], ["android"]]
+    # 4. Android VR
+    # 5. Android player
+    fast_strategies = [[], ["web"], ["mweb"], ["android_vr"], ["android"]]
     last_error = None
 
     for clients in fast_strategies:
@@ -872,7 +872,7 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
         if cookie_file and os.path.exists(cookie_file):
             ydl_opts_all["cookiefile"] = cookie_file
         with yt_dlp.YoutubeDL(ydl_opts_all) as ydl:
-            all_info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            all_info = ydl.extract_info(f"https://music.youtube.com/watch?v={video_id}", download=False)
             results["available_formats"] = [
                 {
                     "id": f.get("format_id"),
@@ -888,7 +888,7 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
         results["available_formats_error"] = str(fe)
 
     format_sel = "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best[height<=480]/best"
-    for client in ["web", "mweb", "android_vr", "ios", "default", "android"]:
+    for client in ["default", "web", "mweb", "android_vr", "ios", "android"]:
         try:
             ydl_opts = {
                 "format": format_sel,
@@ -906,7 +906,7 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
             if client not in ("android", "android_vr", "ios"):
                 ydl_opts["http_headers"] = YDL_HEADERS
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                info = ydl.extract_info(f"https://music.youtube.com/watch?v={video_id}", download=False)
                 audio_url = info.get("url")
                 if not audio_url and "requested_formats" in info:
                     for f in info["requested_formats"]:
