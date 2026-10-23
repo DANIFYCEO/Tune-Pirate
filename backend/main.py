@@ -29,6 +29,8 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from ytmusicapi import YTMusic
 
+from neural_engine import pirate_brain
+
 # ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -809,14 +811,23 @@ def rank_search_results(query: str, raw_songs: list[dict], limit: int) -> list[d
 
 # ─── Search ────────────────────────────────────────────────────────────────────
 @app.get("/api/search")
-def search(q: str = "", limit: int = Query(default=20, le=50)):
-    """Search for songs with Spotify-grade relevance ranking & duration filtering."""
+def search(
+    q: str = "",
+    limit: int = Query(default=20, le=50),
+    user_id: Optional[str] = Query(None),
+):
+    """Search for songs with Spotify-grade relevance ranking & neural personalization."""
     if not q.strip():
         return {"songs": [], "query": ""}
     try:
         # Fetch extra candidates for intelligent re-ranking and junk filtering
         results = yt.search(q.strip(), filter="songs", limit=limit * 2 + 10)
-        songs = rank_search_results(q.strip(), results, limit=limit)
+        songs = rank_search_results(q.strip(), results, limit=limit * 2)
+        # Apply neural personalization if user_id or profile is active
+        if user_id:
+            songs = pirate_brain.rerank_search_results(q.strip(), songs, user_id=user_id, limit=limit)
+        else:
+            songs = songs[:limit]
         return {"songs": songs, "query": q}
     except Exception as e:
         logger.error(f"Search error: {e}")
@@ -960,6 +971,7 @@ def get_audio_url(
     title: Optional[str] = Query(None),
     artist: Optional[str] = Query(None),
     direct: bool = Query(False),
+    user_id: Optional[str] = Query(None),
 ):
     """Returns an audio stream URL for native playback (expo-av / expo-audio).
     External CDNs (mp3.pm, JioSaavn, SoundCloud) stream directly with zero latency & CORS.
@@ -971,11 +983,29 @@ def get_audio_url(
         audio_url, extracted_title, duration = _extract_audio_url(vid, query_hint=hint)
         base_url = _get_base_url(request)
 
+        # Passive neural telemetry: register listen start event
+        resolved_artist = artist or (extracted_title.split("-")[0].strip() if "-" in extracted_title else "")
+        resolved_title = title or (extracted_title.split("-")[1].strip() if "-" in extracted_title else extracted_title)
+        if resolved_title:
+            try:
+                pirate_brain.record_interaction(
+                    user_id=user_id or "default_user",
+                    track_id=vid,
+                    title=resolved_title,
+                    artist=resolved_artist or "Unknown",
+                    action="listen_start",
+                    total_duration=duration or 180,
+                )
+            except Exception:
+                pass
+
         params = []
         if title:
             params.append(f"title={quote(title)}")
         if artist:
             params.append(f"artist={quote(artist)}")
+        if user_id:
+            params.append(f"user_id={quote(user_id)}")
         qs = f"?{'&'.join(params)}" if params else ""
 
         proxy_url = f"{base_url}/api/stream-proxy/{vid}{qs}"
@@ -1886,30 +1916,105 @@ def ai_chat(message: str = ""):
     }
 
 
-# ─── Tonight's Frequency ──────────────────────────────────────────────────────
+# ─── Neural Feedback & Personalization Endpoints ──────────────────────────────
+class FeedbackPayload(BaseModel):
+    user_id: Optional[str] = None
+    userId: Optional[str] = None
+    track_id: Optional[str] = None
+    trackId: Optional[str] = None
+    title: Optional[str] = ""
+    artist: Optional[str] = ""
+    action: Optional[str] = "completed"
+    duration_listened: Optional[float] = None
+    durationListened: Optional[float] = None
+    total_duration: Optional[float] = None
+    totalDuration: Optional[float] = None
+
+    def get_user_id(self) -> str:
+        return (self.user_id or self.userId or "default_user").strip()
+
+    def get_track_id(self) -> str:
+        return (self.track_id or self.trackId or "unknown_track").strip()
+
+    def get_duration_listened(self) -> float:
+        val = self.duration_listened if self.duration_listened is not None else self.durationListened
+        return float(val or 0.0)
+
+    def get_total_duration(self) -> float:
+        val = self.total_duration if self.total_duration is not None else self.totalDuration
+        return float(val or 180.0)
+
+
+@app.post("/api/recommend/feedback")
+def submit_feedback(payload: FeedbackPayload):
+    """
+    Real-Time Online Telemetry:
+    Receives user interaction events and updates the neural taste profile immediately.
+    Accepts both camelCase (userId, trackId, etc.) and snake_case (user_id, track_id, etc.).
+    """
+    user_id = payload.get_user_id()
+    track_id = payload.get_track_id()
+    res = pirate_brain.record_interaction(
+        user_id=user_id,
+        track_id=track_id,
+        title=payload.title or "Track",
+        artist=payload.artist or "Artist",
+        action=payload.action or "completed",
+        duration_listened=payload.get_duration_listened(),
+        total_duration=payload.get_total_duration(),
+    )
+    pirate_brain.save_profiles()
+    return res
+
+
+@app.get("/api/recommend/profile/{user_id}")
+def get_user_profile(user_id: str):
+    """Inspect learned neural profile, top genres, artists, and interaction counts."""
+    profile = pirate_brain.get_or_create_profile(user_id)
+    return {
+        "userId": user_id,
+        "totalInteractions": profile.total_interactions,
+        "likesCount": profile.likes_count,
+        "skipsCount": profile.skips_count,
+        "topGenres": [{"genre": g, "affinity": round(a, 4)} for g, a in profile.get_top_genres(5)],
+        "topArtists": [{"artist": a, "affinity": round(s, 4)} for a, s in profile.get_top_artists(5)],
+        "recentTracks": profile.history[-10:],
+    }
+
+
+# ─── Tonight's Frequency (Neural Personalized Vibe Feed) ──────────────────────
 @app.get("/api/frequency")
-def get_frequency():
-    """Tonight's Frequency — personalized playlist based on time of day."""
+def get_frequency(user_id: Optional[str] = Query(None)):
+    """Tonight's Frequency — personalized neural playlist based on user taste & time of day."""
     hour = datetime.now().hour
+
+    profile = pirate_brain.get_or_create_profile(user_id or "default_user")
+    top_genres = profile.get_top_genres(2)
+    top_genre = top_genres[0][0] if top_genres and top_genres[0][1] > 0.1 else None
 
     if 5 <= hour < 12:
         mood = "Morning"
         description = "Calm, Energetic, Fresh"
-        query = "morning feel good acoustic"
+        query = f"morning {top_genre} feel good acoustic" if top_genre else "morning feel good acoustic"
     elif 12 <= hour < 17:
         mood = "Afternoon"
         description = "Upbeat, Focused, Vibrant"
-        query = "afternoon upbeat pop hits"
+        query = f"afternoon {top_genre} upbeat hits" if top_genre else "afternoon upbeat pop hits"
     elif 17 <= hour < 21:
         mood = "Evening"
         description = "Smooth, Atmospheric, Warm"
-        query = "evening smooth r&b jazz"
+        query = f"evening {top_genre} smooth vibe" if top_genre else "evening smooth r&b jazz"
     else:
         mood = "Late Night"
         description = "Calm, Atmospheric, Late-night"
-        query = "late night chill lo-fi vibes"
+        query = f"late night {top_genre} chill lo-fi vibes" if top_genre else "late night chill lo-fi vibes"
 
-    songs = search_songs(query, 15)
+    songs = search_songs(query, 20)
+    if user_id and songs:
+        songs = pirate_brain.rank_tracks_bart(user_id, songs, limit=15)
+    else:
+        songs = songs[:15]
+
     cover = songs[0]["cover"] if songs else ""
 
     return {
@@ -1917,19 +2022,25 @@ def get_frequency():
         "description": description,
         "cover": cover,
         "songs": songs,
+        "personalized": bool(top_genre),
     }
 
 
-# ─── Spotify-Style Song Radio ──────────────────────────────────────────────────
+# ─── Spotify-Style Song Radio (Neural BaRT Powered) ───────────────────────────
 @app.get("/api/radio/{video_id}")
-def get_song_radio(video_id: str, limit: int = Query(default=30, le=50)):
+def get_song_radio(
+    video_id: str,
+    limit: int = Query(default=30, le=50),
+    user_id: Optional[str] = Query(None),
+):
     """
     Spotify-Style Song Radio:
-    Given any song, generates an endless seamless station of matching vibe tracks.
+    Given any song, generates an endless seamless station of matching vibe tracks,
+    refined and sequenced by PirateBrain BaRT bandit.
     """
     vid = _validate_video_id(video_id)
     try:
-        watch = yt.get_watch_playlist(vid, radio=True, limit=limit + 10)
+        watch = yt.get_watch_playlist(vid, radio=True, limit=limit + 15)
         tracks = watch.get("tracks", [])
         songs = []
         seen = set([vid])
@@ -1941,25 +2052,31 @@ def get_song_radio(video_id: str, limit: int = Query(default=30, le=50)):
             if is_full_song(formatted):
                 seen.add(t_vid)
                 songs.append(formatted)
-            if len(songs) >= limit:
-                break
+
+        if user_id and songs:
+            songs = pirate_brain.rank_tracks_bart(user_id, songs, limit=limit)
+        else:
+            songs = songs[:limit]
+
         return {"seedId": vid, "songs": songs}
     except Exception as e:
         logger.error(f"Song radio error for {vid}: {e}")
         raise HTTPException(status_code=502, detail="Could not generate song radio")
 
 
-# ─── Infinite Autoplay Queue (Session Deduplicated) ───────────────────────────
+# ─── Infinite Autoplay Queue (Session Deduplicated & Neural Ranked) ───────────
 @app.get("/api/infinite-queue")
 def infinite_queue(
     video_id: str,
     count: int = Query(default=15, le=30),
     exclude_ids: str = Query(default=""),
+    user_id: Optional[str] = Query(None),
 ):
     """
     Infinite Autoplay:
     Returns the next batch of songs matching the current playing track when the queue runs out.
-    Uses exclude_ids to prevent song repeats within the same listening session.
+    Uses exclude_ids to prevent song repeats within the same listening session,
+    and applies PirateBrain BaRT bandit to personalize playback flow.
     """
     vid = _validate_video_id(video_id)
     exclude_set = set(e.strip() for e in exclude_ids.split(",") if e.strip())
@@ -1979,15 +2096,19 @@ def infinite_queue(
             if is_full_song(formatted):
                 seen.add(t_vid)
                 songs.append(formatted)
-            if len(songs) >= count:
-                break
+
+        if user_id and songs:
+            songs = pirate_brain.rank_tracks_bart(user_id, songs, limit=count)
+        else:
+            songs = songs[:count]
+
         return {"songs": songs}
     except Exception as e:
         logger.error(f"Infinite queue error for {vid}: {e}")
         return {"songs": []}
 
 
-# ─── Multi-Daily Mixes (Spotify Daily Mix 1 - 6) ───────────────────────────────
+# ─── Multi-Daily Mixes (Spotify Daily Mix 1 - 6 with Neural Adaptation) ───────
 DAILY_MIX_GENRES = [
     {
         "id": "daily-mix-1",
@@ -2043,14 +2164,22 @@ DAILY_MIX_GENRES = [
 def get_daily_mixes(
     top_artists: str = Query(default=""),
     limit_per_mix: int = Query(default=10, le=25),
+    user_id: Optional[str] = Query(None),
 ):
     """
     Generate 6 distinct personalized Daily Mixes like Spotify:
     - Clusters tracks by sonic identity (Afro, Hip Hop, R&B, Pop, Chill, Electronic).
-    - Injects user's preferred artists if they match a cluster.
+    - Injects user's learned favorite artists from PirateBrain profile.
     - 70% familiar tracks + 30% discovery tracks.
     """
+    profile = pirate_brain.get_or_create_profile(user_id or "default_user")
+    learned_artists = [a[0] for a in profile.get_top_artists(5)]
+
     user_artists = [a.strip().lower() for a in top_artists.split(",") if a.strip()]
+    for la in learned_artists:
+        if la.lower() not in user_artists:
+            user_artists.append(la.lower())
+
     mixes = []
 
     for cluster in DAILY_MIX_GENRES:
@@ -2058,8 +2187,13 @@ def get_daily_mixes(
         chosen_seeds = matched_user_artists[:2] if matched_user_artists else random.sample(cluster["seeds"], min(2, len(cluster["seeds"])))
         primary_seed = chosen_seeds[0]
 
-        cluster_songs = search_songs(f"{primary_seed} hits essentials", limit=limit_per_mix)
+        cluster_songs = search_songs(f"{primary_seed} hits essentials", limit=limit_per_mix + 5)
         if cluster_songs:
+            if user_id:
+                cluster_songs = pirate_brain.rank_tracks_bart(user_id, cluster_songs, limit=limit_per_mix)
+            else:
+                cluster_songs = cluster_songs[:limit_per_mix]
+
             mixes.append({
                 "id": cluster["id"],
                 "title": cluster["title"],
@@ -2080,6 +2214,7 @@ def get_discover_feed(
     recent_ids: str = Query(default=""),
     top_artists: str = Query(default=""),
     time_of_day: str = Query(default=""),
+    user_id: Optional[str] = Query(None),
 ):
     """
     Ever-Changing Personalized Discovery Engine (Spotify-like):
@@ -2087,6 +2222,12 @@ def get_discover_feed(
     """
     recent_list = [v.strip() for v in recent_ids.split(",") if v.strip() and VIDEO_ID_PATTERN.match(v.strip())]
     artists_list = [a.strip() for a in top_artists.split(",") if a.strip()]
+
+    profile = pirate_brain.get_or_create_profile(user_id or "default_user")
+    learned_artists = [a[0] for a in profile.get_top_artists(4)]
+    for la in learned_artists:
+        if la not in artists_list:
+            artists_list.append(la)
 
     hour = datetime.now().hour
     day_name = datetime.now().strftime("%A")
@@ -2108,34 +2249,45 @@ def get_discover_feed(
         vibe_title = "Midnight Frequency"
         vibe_query = "late night lo-fi chill aesthetic"
 
-    time_mix_songs = search_songs(vibe_query, 12)
+    time_mix_songs = search_songs(vibe_query, 16)
+    if user_id and time_mix_songs:
+        time_mix_songs = pirate_brain.rank_tracks_bart(user_id, time_mix_songs, limit=12)
+    else:
+        time_mix_songs = time_mix_songs[:12]
 
     for_you_songs = []
     if recent_list:
         try:
-            watch = yt.get_watch_playlist(recent_list[0], radio=True, limit=15)
+            watch = yt.get_watch_playlist(recent_list[0], radio=True, limit=18)
             for t in watch.get("tracks", []):
                 t_vid = t.get("videoId")
                 if t_vid and t_vid not in recent_list:
                     formatted = format_track(t)
                     if is_full_song(formatted):
                         for_you_songs.append(formatted)
-                if len(for_you_songs) >= 10:
-                    break
         except Exception as e:
             logger.warning(f"Failed to generate radio for {recent_list[0]}: {e}")
 
     if not for_you_songs:
         if artists_list:
-            for_you_songs = search_songs(f"songs similar to {artists_list[0]}", 10)
+            for_you_songs = search_songs(f"songs similar to {artists_list[0]}", 16)
         else:
-            for_you_songs = search_songs("top viral hits today", 10)
+            for_you_songs = search_songs("top viral hits today", 16)
+
+    if user_id and for_you_songs:
+        for_you_songs = pirate_brain.rank_tracks_bart(user_id, for_you_songs, limit=10)
+    else:
+        for_you_songs = for_you_songs[:10]
 
     artist_mixes = []
     sample_artists = artists_list[:2] if artists_list else ["Burna Boy", "The Weeknd"]
     for art in sample_artists:
-        songs = search_songs(f"{art} essential hits", 8)
+        songs = search_songs(f"{art} essential hits", 12)
         if songs:
+            if user_id:
+                songs = pirate_brain.rank_tracks_bart(user_id, songs, limit=8)
+            else:
+                songs = songs[:8]
             artist_mixes.append({
                 "artist": art,
                 "title": f"Daily Mix: {art}",
@@ -2144,7 +2296,11 @@ def get_discover_feed(
             })
 
     radar_query = f"new releases {artists_list[0]}" if artists_list else "new music trending chart"
-    discovery_radar = search_songs(radar_query, 10)
+    discovery_radar = search_songs(radar_query, 14)
+    if user_id and discovery_radar:
+        discovery_radar = pirate_brain.rank_tracks_bart(user_id, discovery_radar, limit=10, exploration_ratio=0.50)
+    else:
+        discovery_radar = discovery_radar[:10]
 
     return {
         "timestamp": datetime.now().isoformat(),
@@ -2169,4 +2325,9 @@ def get_discover_feed(
 @app.get("/api/health")
 def health_check():
     """Simple health check endpoint."""
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "neuralEngine": "PirateBrain v2.0",
+        "activeProfiles": len(pirate_brain.profiles),
+    }
