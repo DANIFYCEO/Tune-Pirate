@@ -345,17 +345,17 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
     cookie_path = _get_cookie_file()
     po_token = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
 
-    # Format selector: prioritize m4a/bestaudio, but automatically fall back to 360p MP4 container
-    # (AAC audio, itag 18) if YouTube enables SABR streaming on audio-only itags.
-    format_selector = "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best"
+    # Format selector: prioritize m4a/bestaudio, but automatically fall back to MP4 container
+    # (AAC audio, itag 18 or 22) if YouTube enables SABR streaming on audio-only itags.
+    format_selector = "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best[height<=480]/best"
 
     # Prioritized client strategies:
-    # 1. Android player (extracts clean mp4/aac formats without web bot challenges)
-    # 2. Android Music player
-    # 3. iOS player
-    # 4. Mobile web (mweb)
-    # 5. Default web client
-    fast_strategies = [["android"], ["android_music"], ["ios"], ["mweb"], []]
+    # 1. Default (uses bgutil-ytdlp-pot-provider PO Token provider on 127.0.0.1:4416)
+    # 2. Web client with POT
+    # 3. Mobile web (mweb)
+    # 4. Android player
+    # 5. iOS player
+    fast_strategies = [[], ["web"], ["mweb"], ["android"], ["ios"]]
     last_error = None
 
     # Try extraction (first with cookies if available, and if invalid/failed, without cookies)
@@ -767,17 +767,27 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
         except Exception as ce:
             results["cookie_read_error"] = str(ce)
 
-    for client in ["android", "android_music", "mweb", "ios", "web"]:
+    # Check if local POT provider server is responding on 127.0.0.1:4416
+    try:
+        import urllib.request
+        req = urllib.request.urlopen("http://127.0.0.1:4416", timeout=2)
+        results["pot_provider_status"] = req.status
+    except Exception as pe:
+        results["pot_provider_status"] = str(pe)
+
+    format_sel = "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best[height<=480]/best"
+    for client in ["default", "web", "mweb", "android", "ios"]:
         try:
             ydl_opts = {
-                "format": "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best",
+                "format": format_sel,
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
-                "socket_timeout": 12,
-                "extractor_args": {"youtube": {"player_client": [client]}},
+                "socket_timeout": 15,
             }
-            if client not in ("android", "android_music", "ios"):
+            if client != "default":
+                ydl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            if client not in ("android", "ios"):
                 ydl_opts["http_headers"] = YDL_HEADERS
             if cookie_file and os.path.exists(cookie_file):
                 ydl_opts["cookiefile"] = cookie_file
