@@ -261,12 +261,51 @@ def _get_cookie_file() -> Optional[str]:
     """
     Returns path to a valid Netscape cookies file if available.
     Supports:
-    1. YOUTUBE_COOKIES_FILE env var
-    2. Local cookies.txt in backend or project directory
-    3. YOUTUBE_COOKIES_B64 env var (base64-encoded Netscape cookie file)
-    4. YOUTUBE_COOKIES env var (raw Netscape cookies text)
+    1. YOUTUBE_COOKIES_B64 env var (base64-encoded Netscape cookie file, e.g. Azure secret)
+    2. YOUTUBE_COOKIES env var (raw Netscape cookies text)
+    3. YOUTUBE_COOKIES_FILE env var
+    4. Local cookies.txt in backend or project directory
+    5. Previously written /tmp/youtube_cookies.txt (e.g. via /api/admin/cookies)
     """
     global _cookie_file_path
+
+    target = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
+
+    # 1. Base64 environment variable (e.g. from Azure Container Apps secret)
+    b64_content = os.environ.get("YOUTUBE_COOKIES_B64")
+    if b64_content and len(b64_content.strip()) > 10:
+        try:
+            decoded = base64.b64decode(b64_content.strip()).decode("utf-8", errors="ignore")
+            if len(decoded) > 10:
+                needs_write = True
+                if os.path.exists(target):
+                    try:
+                        with open(target, "r", encoding="utf-8") as f:
+                            if f.read() == decoded:
+                                needs_write = False
+                    except Exception:
+                        pass
+                if needs_write:
+                    with open(target, "w", encoding="utf-8") as f:
+                        f.write(decoded)
+                    logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES_B64 -> {target} ({len(decoded)} bytes)")
+                _cookie_file_path = target
+                return _cookie_file_path
+        except Exception as e:
+            logger.error(f"Failed to decode YOUTUBE_COOKIES_B64: {e}")
+
+    # 2. Raw text environment variable
+    raw_content = os.environ.get("YOUTUBE_COOKIES")
+    if raw_content and len(raw_content.strip()) > 10:
+        try:
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(raw_content.strip())
+            logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES -> {target}")
+            _cookie_file_path = target
+            return _cookie_file_path
+        except Exception as e:
+            logger.error(f"Failed to write YOUTUBE_COOKIES: {e}")
+
     if _cookie_file_path and os.path.exists(_cookie_file_path) and os.path.getsize(_cookie_file_path) > 10:
         return _cookie_file_path
 
@@ -287,30 +326,9 @@ def _get_cookie_file() -> Optional[str]:
             _cookie_file_path = candidate
             return _cookie_file_path
 
-    b64_content = os.environ.get("YOUTUBE_COOKIES_B64")
-    if b64_content:
-        try:
-            decoded = base64.b64decode(b64_content.strip()).decode("utf-8", errors="ignore")
-            target = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(decoded)
-            logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES_B64 -> {target} ({len(decoded)} bytes)")
-            _cookie_file_path = target
-            return _cookie_file_path
-        except Exception as e:
-            logger.error(f"Failed to decode YOUTUBE_COOKIES_B64: {e}")
-
-    raw_content = os.environ.get("YOUTUBE_COOKIES")
-    if raw_content and len(raw_content.strip()) > 10:
-        try:
-            target = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(raw_content.strip())
-            logger.info(f"Loaded YouTube cookies from YOUTUBE_COOKIES -> {target}")
-            _cookie_file_path = target
-            return _cookie_file_path
-        except Exception as e:
-            logger.error(f"Failed to write YOUTUBE_COOKIES: {e}")
+    if os.path.exists(target) and os.path.getsize(target) > 10:
+        _cookie_file_path = target
+        return _cookie_file_path
 
     return None
 
@@ -749,6 +767,61 @@ def get_audio_url(
         raise HTTPException(status_code=502, detail="Failed to extract audio URL")
 
 
+class CookiePayload(BaseModel):
+    content: Optional[str] = None
+    b64_content: Optional[str] = None
+
+
+@app.post("/api/admin/cookies")
+def update_cookies(payload: CookiePayload):
+    """Dynamically upload or replace YouTube cookies on the running instance."""
+    global _cookie_file_path, _stream_cache
+    text = payload.content
+    if not text and payload.b64_content:
+        try:
+            text = base64.b64decode(payload.b64_content.strip()).decode("utf-8", errors="ignore")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
+    if not text or len(text.strip()) < 10:
+        raise HTTPException(status_code=400, detail="Cookie content is empty or too short")
+
+    target = os.path.join(tempfile.gettempdir(), "youtube_cookies.txt")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(text.strip())
+    _cookie_file_path = target
+    _stream_cache.clear()
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip() and not l.startswith("#")]
+    names = [l.split("\t")[5] for l in lines if len(l.split("\t")) >= 6]
+    logger.info(f"Admin updated cookies: {len(names)} cookies ({len(text)} bytes)")
+    return {
+        "status": "ok",
+        "file": target,
+        "size": len(text),
+        "count": len(names),
+        "cookies": names,
+    }
+
+
+@app.get("/api/admin/cookies/reload")
+def reload_cookies():
+    """Force re-reading YOUTUBE_COOKIES_B64 or disk cookies."""
+    global _cookie_file_path, _stream_cache
+    _cookie_file_path = None
+    _stream_cache.clear()
+    cookie_file = _get_cookie_file()
+    names = []
+    if cookie_file and os.path.exists(cookie_file):
+        with open(cookie_file, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+            names = [l.split("\t")[5] for l in lines if len(l.split("\t")) >= 6]
+    return {
+        "status": "ok",
+        "cookie_file": cookie_file,
+        "cookie_count": len(names),
+        "cookie_names": names,
+    }
+
+
 @app.get("/api/debug/extract/{video_id}")
 def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Optional[str] = Query(None)):
     """Diagnostic endpoint to inspect extraction behavior directly on Azure."""
@@ -769,8 +842,8 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
     # Check if local POT provider server is responding on 127.0.0.1:4416
     try:
         import urllib.request
-        req = urllib.request.urlopen("http://127.0.0.1:4416", timeout=2)
-        results["pot_provider_status"] = req.status
+        req = urllib.request.urlopen("http://127.0.0.1:4416/ping", timeout=2)
+        results["pot_provider_status"] = req.read().decode("utf-8").strip()
     except Exception as pe:
         results["pot_provider_status"] = str(pe)
 
@@ -801,7 +874,7 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
         results["available_formats_error"] = str(fe)
 
     format_sel = "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best[height<=480]/best"
-    for client in ["default", "web", "mweb", "android", "ios"]:
+    for client in ["android_vr", "android", "web", "mweb", "ios", "default"]:
         try:
             ydl_opts = {
                 "format": format_sel,
@@ -812,10 +885,11 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
             }
             if client != "default":
                 ydl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
-            if client not in ("android", "ios"):
+            is_mobile = client in ("android", "android_vr", "ios")
+            if not is_mobile:
                 ydl_opts["http_headers"] = YDL_HEADERS
-            if cookie_file and os.path.exists(cookie_file):
-                ydl_opts["cookiefile"] = cookie_file
+                if cookie_file and os.path.exists(cookie_file):
+                    ydl_opts["cookiefile"] = cookie_file
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
                 results[client] = {
