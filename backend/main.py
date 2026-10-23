@@ -367,8 +367,11 @@ def _clean_search_query(query: str) -> str:
     return q
 
 
-def _verify_stream_url(url: str, referer: Optional[str] = None, timeout: float = 2.0) -> bool:
-    """Rapidly verify stream URL responds with 200 or 206 before handing off to player."""
+def _verify_stream_url(url: str, referer: Optional[str] = None, timeout: float = 2.5, min_bytes: int = 1800000) -> bool:
+    """
+    Rapidly verify stream URL responds with 200 or 206 and confirms the file
+    is a full audio track (> 1.8MB) rather than a 15-30 second ringtone/snippet.
+    """
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -378,7 +381,18 @@ def _verify_stream_url(url: str, referer: Optional[str] = None, timeout: float =
             headers["Referer"] = referer
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status in (200, 206)
+            if resp.status not in (200, 206):
+                return False
+            # Check Content-Range header to filter out 15-30s ringtones (< 1.8MB)
+            cr = resp.headers.get("Content-Range", "")
+            if cr and "/" in cr:
+                total_str = cr.split("/")[-1].strip()
+                if total_str.isdigit():
+                    total_bytes = int(total_str)
+                    if total_bytes < min_bytes:
+                        logger.warning(f"Rejecting audio snippet/ringtone: only {total_bytes} bytes for {url[:70]}")
+                        return False
+            return True
     except Exception:
         return False
 
@@ -386,7 +400,7 @@ def _verify_stream_url(url: str, referer: Optional[str] = None, timeout: float =
 def _search_mp3_pm(query: str) -> Optional[tuple[str, str, int]]:
     """
     Search mp3.pm for high-fidelity direct MP3 stream.
-    Zero bot blocks, byte-range seeking supported, CORS enabled.
+    Filters out ringtones/snippets and ensures full track duration (> 75s).
     """
     cleaned = _clean_search_query(query)
     safe_q = re.sub(r"[^a-zA-Z0-9]+", "+", cleaned.lower()).strip("+")
@@ -408,7 +422,8 @@ def _search_mp3_pm(query: str) -> Optional[tuple[str, str, int]]:
         pattern = re.compile(
             r'class="cplayer-sound-item"[^>]*?data-sound-url="([^"]+)"[^>]*?>'
             r'.*?<i class="cplayer-data-sound-author">([^<]*)</i>.*?'
-            r'<b class="cplayer-data-sound-title">([^<]*)</b>',
+            r'<b class="cplayer-data-sound-title">([^<]*)</b>'
+            r'(?:.*?<em class="cplayer-data-sound-time">([^<]*)</em>)?',
             re.DOTALL | re.IGNORECASE,
         )
         items = pattern.findall(page)
@@ -421,14 +436,36 @@ def _search_mp3_pm(query: str) -> Optional[tuple[str, str, int]]:
 
         target_words = set(re.findall(r"\w+", cleaned.lower()))
         ranked = []
-        for sound_url, auth, title in items:
+        for match in items:
+            sound_url = match[0]
+            auth = match[1]
+            title = match[2]
+            time_str = match[3] if len(match) > 3 else ""
+
             clean_auth = html.unescape(auth).strip()
             clean_title = html.unescape(title).strip()
             item_text = f"{clean_auth} {clean_title}".lower()
 
+            # Parse track duration from time_str (MM:SS)
+            dur_sec = 180
+            if time_str and ":" in time_str:
+                parts = time_str.strip().split(":")
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    dur_sec = int(parts[0]) * 60 + int(parts[1])
+
+            # CRITICAL FILTER: Drop ringtones, teasers, and short snippets (< 75 seconds)
+            if dur_sec < 75:
+                continue
+            if any(term in item_text for term in ["ringtone", "snippet", "teaser", "preview", "short edit", "tiktok sound"]):
+                continue
+
             score = 100
             overlap = len(target_words.intersection(re.findall(r"\w+", item_text)))
             score += overlap * 25
+
+            # Standard full song duration bonus (2.5 to 5 minutes)
+            if 150 <= dur_sec <= 300:
+                score += 30
 
             # Penalize unwanted edits / parodies
             if any(j in item_text for j in JUNK_TERMS):
@@ -436,14 +473,14 @@ def _search_mp3_pm(query: str) -> Optional[tuple[str, str, int]]:
 
             sim = difflib.SequenceMatcher(None, cleaned.lower(), item_text).ratio()
             score += int(sim * 60)
-            ranked.append((score, sound_url, f"{clean_auth} - {clean_title}"))
+            ranked.append((score, dur_sec, sound_url, f"{clean_auth} - {clean_title}"))
 
         ranked.sort(key=lambda x: x[0], reverse=True)
-        for _, sound_url, full_title in ranked[:4]:
+        for _, dur_sec, sound_url, full_title in ranked[:6]:
             if _verify_stream_url(sound_url, referer="https://mp3.pm/"):
-                logger.info(f"mp3.pm found verified stream for '{query}': {full_title}")
-                return sound_url, full_title, 180
-            logger.info(f"mp3.pm candidate dead, verifying next: {full_title}")
+                logger.info(f"mp3.pm found verified full stream ({dur_sec}s) for '{query}': {full_title}")
+                return sound_url, full_title, dur_sec
+            logger.info(f"mp3.pm candidate dead or snippet, verifying next: {full_title}")
         return None
     except Exception as e:
         logger.warning(f"mp3.pm search failed for '{query}': {e}")
@@ -476,8 +513,16 @@ def _search_saavn(query: str) -> Optional[tuple[str, str, int]]:
                 title = item.get("title", "")
                 subtitle = item.get("subtitle", "")
                 text = f"{subtitle} {title}".lower()
+                dur = int(item.get("more_info", {}).get("duration") or 0)
+                # CRITICAL: Drop ringtones, snippets, teasers (< 75 seconds)
+                if dur and dur < 75:
+                    continue
+                if any(term in text for term in ["ringtone", "snippet", "teaser", "preview", "short edit", "tiktok sound"]):
+                    continue
                 score = 100
                 score += len(target_words.intersection(re.findall(r"\w+", text))) * 25
+                if 150 <= dur <= 300:
+                    score += 30
                 if any(j in text for j in JUNK_TERMS):
                     score -= 90
                 sim = difflib.SequenceMatcher(None, cleaned.lower(), text).ratio()
@@ -511,7 +556,7 @@ def _search_saavn(query: str) -> Optional[tuple[str, str, int]]:
 
 def _search_soundcloud(query: str) -> Optional[tuple[str, str, int]]:
     """
-    Search SoundCloud via yt-dlp scsearch1:.
+    Search SoundCloud via yt-dlp scsearch5: and filter out ringtones/snippets.
     """
     cleaned = _clean_search_query(query)
     try:
@@ -523,20 +568,30 @@ def _search_soundcloud(query: str) -> Optional[tuple[str, str, int]]:
             "socket_timeout": 8,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            res = ydl.extract_info(f"scsearch1:{cleaned}", download=False)
+            res = ydl.extract_info(f"scsearch5:{cleaned}", download=False)
             if res and "entries" in res and res["entries"]:
-                entry = res["entries"][0]
-                audio_url = entry.get("url")
-                if not audio_url and "requested_formats" in entry:
-                    for f in entry["requested_formats"]:
-                        if f.get("acodec") != "none" and f.get("url"):
-                            audio_url = f.get("url")
-                            break
-                if audio_url:
+                for entry in res["entries"]:
+                    if not entry:
+                        continue
+                    dur = int(entry.get("duration") or 0)
                     title = entry.get("title", query)
-                    dur = int(entry.get("duration") or 180)
-                    logger.info(f"SoundCloud found match for '{query}': {title}")
-                    return audio_url, title, dur
+                    title_lower = title.lower()
+                    if dur and dur < 75:
+                        continue
+                    if any(term in title_lower for term in ["ringtone", "snippet", "teaser", "preview", "short edit", "tiktok sound"]):
+                        continue
+                    if any(j in title_lower for j in JUNK_TERMS):
+                        continue
+                    audio_url = entry.get("url")
+                    if not audio_url and "requested_formats" in entry:
+                        for f in entry["requested_formats"]:
+                            if f.get("acodec") != "none" and f.get("url"):
+                                audio_url = f.get("url")
+                                break
+                    if audio_url:
+                        dur_sec = dur if dur > 0 else 180
+                        logger.info(f"SoundCloud found match for '{query}': {title} ({dur_sec}s)")
+                        return audio_url, title, dur_sec
     except Exception as e:
         logger.warning(f"SoundCloud search failed for '{query}': {e}")
     return None
@@ -701,21 +756,28 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
                     ]
 
                 with yt_dlp.YoutubeDL(search_opts) as ydl:
-                    search_info = ydl.extract_info(f"ytsearch1:{hint} audio", download=False)
+                    search_info = ydl.extract_info(f"ytsearch3:{hint} audio", download=False)
                     if search_info and "entries" in search_info and search_info["entries"]:
-                        entry = search_info["entries"][0]
-                        audio_url = entry.get("url")
-                        if not audio_url and "requested_formats" in entry:
-                            for f in entry["requested_formats"]:
-                                if f.get("acodec") != "none" and f.get("url"):
-                                    audio_url = f.get("url")
-                                    break
-                        title = entry.get("title", "audio")
-                        duration = entry.get("duration", 0)
-                        if audio_url:
-                            logger.info(f"Search fallback succeeded for {video_id} -> {entry.get('id')} ({title})")
-                            _stream_cache[video_id] = (time.time(), audio_url, title, duration)
-                            return audio_url, title, duration
+                        for entry in search_info["entries"]:
+                            if not entry:
+                                continue
+                            duration = entry.get("duration", 0)
+                            if duration and duration < 75:
+                                continue
+                            title = entry.get("title", "audio")
+                            title_lower = title.lower()
+                            if any(term in title_lower for term in ["ringtone", "snippet", "teaser", "preview", "short edit", "tiktok sound", "#shorts"]):
+                                continue
+                            audio_url = entry.get("url")
+                            if not audio_url and "requested_formats" in entry:
+                                for f in entry["requested_formats"]:
+                                    if f.get("acodec") != "none" and f.get("url"):
+                                        audio_url = f.get("url")
+                                        break
+                            if audio_url:
+                                logger.info(f"Search fallback succeeded for {video_id} -> {entry.get('id')} ({title}) [{duration}s]")
+                                _stream_cache[video_id] = (time.time(), audio_url, title, duration)
+                                return audio_url, title, duration
             except Exception as fallback_err:
                 logger.warning(f"Fallback search failed for '{hint}' (clients={fallback_client}): {fallback_err}")
 
