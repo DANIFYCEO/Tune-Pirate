@@ -53,6 +53,13 @@ export const api = {
     const qs = params.length > 0 ? `?${params.join('&')}` : '';
     return request(`/api/audio-url/${videoId}${qs}`);
   },
+  getDownloadUrl: (videoId, title = '', artist = '') => {
+    const params = [];
+    if (title) params.push(`title=${encodeURIComponent(title)}`);
+    if (artist) params.push(`artist=${encodeURIComponent(artist)}`);
+    const qs = params.length > 0 ? `?${params.join('&')}` : '';
+    return `${API_BASE_URL}/api/download/${videoId}${qs}`;
+  },
   getSongRadio: (videoId, limit = 30) => request(`/api/radio/${videoId}?limit=${limit}`),
   getInfiniteQueue: (videoId, count = 15, excludeIds = '') =>
     request(`/api/infinite-queue?video_id=${videoId}&count=${count}&exclude_ids=${encodeURIComponent(excludeIds)}`),

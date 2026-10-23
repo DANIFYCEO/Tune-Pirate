@@ -31,7 +31,11 @@ export function DownloadProvider({ children }) {
 
       try {
         const videoId = song.youtubeId || song.id;
-        const response = await fetch(`${import.meta.env.VITE_API_URL}/api/download/${videoId}`, {
+        const params = new URLSearchParams();
+        if (song.title) params.append('title', song.title);
+        if (song.artist) params.append('artist', song.artist);
+        const qs = params.toString() ? `?${params.toString()}` : '';
+        const response = await fetch(`${import.meta.env.VITE_API_URL}/api/download/${videoId}${qs}`, {
           signal: controller.signal
         });
 
@@ -66,7 +70,7 @@ export function DownloadProvider({ children }) {
           if (streamErr.name === 'AbortError') throw streamErr;
           // Streaming not supported — fall back to arrayBuffer
           console.warn('Streaming read failed, falling back to arrayBuffer:', streamErr);
-          const fallbackRes = await fetch(`${import.meta.env.VITE_API_URL}/api/download/${videoId}`, {
+          const fallbackRes = await fetch(`${import.meta.env.VITE_API_URL}/api/download/${videoId}${qs}`, {
             signal: controller.signal
           });
           if (!fallbackRes.ok) throw new Error(`Server error: ${fallbackRes.status}`);
