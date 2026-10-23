@@ -5,12 +5,16 @@ Provides music search, streaming, downloads, and discovery via YouTube Music.
 
 import base64
 import difflib
+import html
+import json
 import logging
 import os
 import random
 import re
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from functools import wraps
 from typing import Optional
@@ -351,33 +355,244 @@ def _validate_video_id(video_id: str) -> str:
     return vid
 
 
+# ─── Multi-Source Audio Engine (mp3.pm, JioSaavn, SoundCloud, YouTube Music) ───
+
+def _clean_search_query(query: str) -> str:
+    """Clean video/audio noise to maximize music metadata hit rate."""
+    q = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", query)
+    q = re.sub(r"\b(official|music|video|audio|lyrics|visualizer|explicit|hd|4k|feat|ft)\b", " ", q, flags=re.I)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def _verify_stream_url(url: str, referer: Optional[str] = None, timeout: float = 2.0) -> bool:
+    """Rapidly verify stream URL responds with 200 or 206 before handing off to player."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Range": "bytes=0-100",
+        }
+        if referer:
+            headers["Referer"] = referer
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status in (200, 206)
+    except Exception:
+        return False
+
+
+def _search_mp3_pm(query: str) -> Optional[tuple[str, str, int]]:
+    """
+    Search mp3.pm for high-fidelity direct MP3 stream.
+    Zero bot blocks, byte-range seeking supported, CORS enabled.
+    """
+    cleaned = _clean_search_query(query)
+    safe_q = re.sub(r"[^a-zA-Z0-9]+", "+", cleaned.lower()).strip("+")
+    if not safe_q:
+        return None
+    url = f"https://mp3.pm/s/f/{safe_q}/"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=7) as resp:
+            page = resp.read().decode("utf-8", errors="ignore")
+
+        pattern = re.compile(
+            r'class="cplayer-sound-item"[^>]*?data-sound-url="([^"]+)"[^>]*?>'
+            r'.*?<i class="cplayer-data-sound-author">([^<]*)</i>.*?'
+            r'<b class="cplayer-data-sound-title">([^<]*)</b>',
+            re.DOTALL | re.IGNORECASE,
+        )
+        items = pattern.findall(page)
+        if not items:
+            urls = re.findall(r'data-sound-url="([^"]+)"', page)
+            for u in urls[:3]:
+                if _verify_stream_url(u, referer="https://mp3.pm/"):
+                    return u, query, 180
+            return None
+
+        target_words = set(re.findall(r"\w+", cleaned.lower()))
+        ranked = []
+        for sound_url, auth, title in items:
+            clean_auth = html.unescape(auth).strip()
+            clean_title = html.unescape(title).strip()
+            item_text = f"{clean_auth} {clean_title}".lower()
+
+            score = 100
+            overlap = len(target_words.intersection(re.findall(r"\w+", item_text)))
+            score += overlap * 25
+
+            # Penalize unwanted edits / parodies
+            if any(j in item_text for j in JUNK_TERMS):
+                score -= 80
+
+            sim = difflib.SequenceMatcher(None, cleaned.lower(), item_text).ratio()
+            score += int(sim * 60)
+            ranked.append((score, sound_url, f"{clean_auth} - {clean_title}"))
+
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        for _, sound_url, full_title in ranked[:4]:
+            if _verify_stream_url(sound_url, referer="https://mp3.pm/"):
+                logger.info(f"mp3.pm found verified stream for '{query}': {full_title}")
+                return sound_url, full_title, 180
+            logger.info(f"mp3.pm candidate dead, verifying next: {full_title}")
+        return None
+    except Exception as e:
+        logger.warning(f"mp3.pm search failed for '{query}': {e}")
+        return None
+
+
+def _search_saavn(query: str) -> Optional[tuple[str, str, int]]:
+    """
+    Search JioSaavn for 320kbps Akamai/Azure CDN MP4 stream with DES decryption.
+    """
+    try:
+        from Crypto.Cipher import DES
+    except ImportError:
+        return None
+
+    cleaned = _clean_search_query(query)
+    url = f"https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&api_version=4&ctx=web6dot0&p=1&n=5&q={quote(cleaned)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            results = data.get("results", [])
+            if not results:
+                return None
+
+            # Score and rank candidates to prioritize original studio release over karaoke
+            target_words = set(re.findall(r"\w+", cleaned.lower()))
+            ranked_results = []
+            for item in results:
+                title = item.get("title", "")
+                subtitle = item.get("subtitle", "")
+                text = f"{subtitle} {title}".lower()
+                score = 100
+                score += len(target_words.intersection(re.findall(r"\w+", text))) * 25
+                if any(j in text for j in JUNK_TERMS):
+                    score -= 90
+                sim = difflib.SequenceMatcher(None, cleaned.lower(), text).ratio()
+                score += int(sim * 60)
+                ranked_results.append((score, item))
+
+            ranked_results.sort(key=lambda x: x[0], reverse=True)
+
+            for _, best in ranked_results:
+                enc = best.get("more_info", {}).get("encrypted_media_url")
+                if not enc:
+                    continue
+                raw = base64.b64decode(enc)
+                cipher = DES.new(b"38346591", DES.MODE_ECB)
+                dec = cipher.decrypt(raw)
+                pad_len = dec[-1]
+                base_url = dec[:-pad_len].decode("utf-8")
+                hq_url = base_url.replace("_96.mp4", "_320.mp4")
+                chosen_url = hq_url if _verify_stream_url(hq_url, referer="https://www.jiosaavn.com/") else base_url
+                if _verify_stream_url(chosen_url, referer="https://www.jiosaavn.com/"):
+                    dur = int(best.get("more_info", {}).get("duration") or 180)
+                    title = best.get("title", query)
+                    artist = best.get("subtitle", "")
+                    full_title = f"{artist} - {title}" if artist else title
+                    logger.info(f"JioSaavn found verified stream for '{query}': {full_title}")
+                    return chosen_url, full_title, dur
+    except Exception as e:
+        logger.warning(f"JioSaavn search failed for '{query}': {e}")
+    return None
+
+
+def _search_soundcloud(query: str) -> Optional[tuple[str, str, int]]:
+    """
+    Search SoundCloud via yt-dlp scsearch1:.
+    """
+    cleaned = _clean_search_query(query)
+    try:
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "socket_timeout": 8,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            res = ydl.extract_info(f"scsearch1:{cleaned}", download=False)
+            if res and "entries" in res and res["entries"]:
+                entry = res["entries"][0]
+                audio_url = entry.get("url")
+                if not audio_url and "requested_formats" in entry:
+                    for f in entry["requested_formats"]:
+                        if f.get("acodec") != "none" and f.get("url"):
+                            audio_url = f.get("url")
+                            break
+                if audio_url:
+                    title = entry.get("title", query)
+                    dur = int(entry.get("duration") or 180)
+                    logger.info(f"SoundCloud found match for '{query}': {title}")
+                    return audio_url, title, dur
+    except Exception as e:
+        logger.warning(f"SoundCloud search failed for '{query}': {e}")
+    return None
+
+
 def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool = False) -> tuple[str, str, int]:
-    """Rapidly extract a direct audio URL using fast direct client with instant ytsearch fallback."""
+    """Rapidly extract a direct audio URL using multi-source cascade (mp3.pm -> JioSaavn -> SoundCloud -> YouTube)."""
     now = time.time()
     if not force_refresh and video_id in _stream_cache:
         ts, cached_url, cached_title, cached_dur = _stream_cache[video_id]
         if now - ts < STREAM_CACHE_TTL:
             return cached_url, cached_title, cached_dur
 
+    # Resolve track metadata if query hint not supplied
+    hint = (query_hint or "").strip()
+    if not hint:
+        try:
+            meta = yt.get_song(video_id)
+            details = meta.get("videoDetails", {})
+            author = details.get("author", "")
+            song_title = details.get("title", "")
+            hint = f"{author} {song_title}".strip()
+        except Exception:
+            pass
+
+    # 1. Primary Provider: mp3.pm (fast direct MP3, byte ranges, zero bot detection)
+    if hint:
+        mp3_res = _search_mp3_pm(hint)
+        if mp3_res:
+            audio_url, title, dur = mp3_res
+            _stream_cache[video_id] = (time.time(), audio_url, title, dur)
+            return audio_url, title, dur
+
+    # 2. Secondary Provider: JioSaavn 320kbps Akamai CDN stream
+    if hint:
+        saavn_res = _search_saavn(hint)
+        if saavn_res:
+            audio_url, title, dur = saavn_res
+            _stream_cache[video_id] = (time.time(), audio_url, title, dur)
+            return audio_url, title, dur
+
+    # 3. Tertiary Provider: SoundCloud via yt-dlp
+    if hint:
+        sc_res = _search_soundcloud(hint)
+        if sc_res:
+            audio_url, title, dur = sc_res
+            _stream_cache[video_id] = (time.time(), audio_url, title, dur)
+            return audio_url, title, dur
+
+    # 4. Quaternary Provider: YouTube Music direct & ytsearch fallback
     url = f"https://music.youtube.com/watch?v={video_id}"
     cookie_path = _get_cookie_file()
     po_token = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
-
-    # Format selector: prioritize m4a/bestaudio, but automatically fall back to MP4 container
-    # (AAC audio, itag 18 or 22) if YouTube enables SABR streaming on audio-only itags.
     format_selector = "bestaudio/best"
-
-    # Prioritized client strategies:
-    # 1. Default (native YouTube Music extractor - fastest, no bot blocks)
-    # 2. Web client (uses bgutil-ytdlp-pot-provider on 127.0.0.1:4416)
-    # 3. Mobile web (mweb)
-    # 4. Android VR
-    # 5. Android player
     fast_strategies = [[], ["web"], ["mweb"], ["android_vr"], ["android"]]
     last_error = None
 
     for clients in fast_strategies:
-        # Only standard 'android' client rejects cookies in yt-dlp; android_vr, web, mweb, ios all support cookies
         skip_cookie = any(c == "android" for c in clients)
         current_cookie = None if skip_cookie else cookie_path
 
@@ -392,7 +607,6 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
             "js_runtimes": {"node": {}},
             "plugin_dirs": ["/pot", "/app", "/root/.yt-dlp-plugins", "default"],
         }
-        # Only add desktop browser headers when NOT spoofing a mobile client
         if not any(c in ("android_vr", "android", "android_music", "ios") for c in clients):
             ydl_opts["http_headers"] = YDL_HEADERS
 
@@ -425,17 +639,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
             last_error = e
             logger.info(f"Direct yt-dlp extract failed for {video_id} (clients={clients}, cookie={bool(current_cookie)}): {e}")
 
-    # If direct extract failed, resolve query hint if not provided
-    hint = (query_hint or "").strip()
-    if not hint:
-        try:
-            meta = yt.get_song(video_id)
-            details = meta.get("videoDetails", {})
-            hint = f"{details.get('author', '')} {details.get('title', '')}".strip()
-        except Exception:
-            pass
-
-    # Instant Fallback: Search for high-fidelity audio version by title/artist
+    # Instant Fallback: YouTube search
     if hint:
         logger.info(f"Direct extract failed for {video_id}. Instant search fallback with hint: '{hint}'")
         for fallback_client in [["web"], ["mweb"], ["android_vr"], []]:
@@ -662,8 +866,14 @@ async def stream_audio_proxy(
     req_headers = {
         "User-Agent": YDL_HEADERS["User-Agent"],
         "Accept": "*/*",
-        "Referer": "https://www.youtube.com/",
     }
+    if "googlevideo.com" in audio_url:
+        req_headers["Referer"] = "https://www.youtube.com/"
+    elif "mp3.pm" in audio_url:
+        req_headers["Referer"] = "https://mp3.pm/"
+    elif "saavncdn.com" in audio_url or "jiosaavn.com" in audio_url:
+        req_headers["Referer"] = "https://www.jiosaavn.com/"
+
     range_header = request.headers.get("range")
     if range_header:
         req_headers["Range"] = range_header
@@ -713,7 +923,10 @@ async def stream_audio_proxy(
             resp_headers[h] = val
 
     if "Content-Type" not in resp_headers:
-        resp_headers["Content-Type"] = "audio/mp4"
+        if ".mp3" in audio_url.lower():
+            resp_headers["Content-Type"] = "audio/mpeg"
+        else:
+            resp_headers["Content-Type"] = "audio/mp4"
 
     # If HEAD request, return headers immediately without streaming body
     if request.method == "HEAD":
@@ -749,7 +962,8 @@ def get_audio_url(
     direct: bool = Query(False),
 ):
     """Returns an audio stream URL for native playback (expo-av / expo-audio).
-    By default returns the streaming proxy URL to avoid googlevideo IP-binding 403s.
+    External CDNs (mp3.pm, JioSaavn, SoundCloud) stream directly with zero latency & CORS.
+    YouTube googlevideo streams fallback through the streaming proxy to bypass IP-lockouts.
     """
     vid = _validate_video_id(video_id)
     hint = f"{artist or ''} {title or ''}".strip()
@@ -766,13 +980,28 @@ def get_audio_url(
 
         proxy_url = f"{base_url}/api/stream-proxy/{vid}{qs}"
 
+        is_external_cdn = any(
+            cdn in audio_url
+            for cdn in ["mp3.pm", "saavncdn.com", "jiosaavn.com", "sndcdn.com", "soundcloud.cloud"]
+        )
+
+        source_name = "youtube"
+        if "mp3.pm" in audio_url:
+            source_name = "mp3.pm"
+        elif "saavncdn.com" in audio_url or "jiosaavn.com" in audio_url:
+            source_name = "jiosaavn"
+        elif "sndcdn.com" in audio_url or "soundcloud.cloud" in audio_url:
+            source_name = "soundcloud"
+
         return {
             "videoId": vid,
-            "audioUrl": audio_url if direct else proxy_url,
+            "audioUrl": audio_url if (direct or is_external_cdn) else proxy_url,
             "directAudioUrl": audio_url,
+            "proxyUrl": proxy_url,
             "title": extracted_title or title or "audio",
             "duration": duration,
-            "proxied": not direct,
+            "proxied": not (direct or is_external_cdn),
+            "source": source_name,
         }
     except Exception as e:
         logger.error(f"Audio URL extraction failed for {vid} (hint='{hint}'): {e}")
@@ -941,25 +1170,38 @@ def get_stream_url(video_id: str):
 
 # ─── Download ──────────────────────────────────────────────────────────────────
 @app.get("/api/download/{video_id}")
-def download_song(video_id: str):
+def download_song(
+    video_id: str,
+    title: Optional[str] = Query(None),
+    artist: Optional[str] = Query(None),
+):
     """Extracts audio and streams it as MP3 via ffmpeg pipe."""
     vid = _validate_video_id(video_id)
+    hint = f"{artist or ''} {title or ''}".strip()
 
     try:
-        audio_url, title, _ = _extract_audio_url(vid)
+        audio_url, resolved_title, _ = _extract_audio_url(vid, query_hint=hint)
     except Exception as e:
         logger.error(f"Download extract error for {vid}: {e}")
         raise HTTPException(status_code=502, detail="Failed to extract audio")
 
-    safe_title = re.sub(r'[<>:"/\\|?*\r\n]', '', title).strip() or vid
+    safe_title = re.sub(r'[<>:"/\\|?*\r\n]', '', resolved_title or title or vid).strip() or vid
     filename = f"{safe_title}.mp3"
+
+    ffmpeg_headers = f"User-Agent: {YDL_HEADERS['User-Agent']}\r\n"
+    if "googlevideo.com" in audio_url:
+        ffmpeg_headers += "Referer: https://www.youtube.com/\r\n"
+    elif "mp3.pm" in audio_url:
+        ffmpeg_headers += "Referer: https://mp3.pm/\r\n"
+    elif "saavncdn.com" in audio_url or "jiosaavn.com" in audio_url:
+        ffmpeg_headers += "Referer: https://www.jiosaavn.com/\r\n"
 
     ffmpeg_cmd = [
         FFMPEG_PATH,
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
-        "-headers", f"User-Agent: {YDL_HEADERS['User-Agent']}\r\nReferer: https://www.youtube.com/\r\n",
+        "-headers", ffmpeg_headers,
         "-i", audio_url,
         "-vn",
         "-ar", "44100",

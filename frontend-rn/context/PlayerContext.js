@@ -183,69 +183,82 @@ export function PlayerProvider({ children }) {
         playerRef.current = null;
       }
 
-      // A. Try modern expo-audio API
-      if (ExpoAudioModule?.createAudioPlayer) {
-        const player = ExpoAudioModule.createAudioPlayer({ uri: audioData.audioUrl });
-
-        if (requestId !== playRequestIdRef.current) {
-          if (player.release) player.release();
-          return;
-        }
-
-        playerRef.current = player;
-
-        if (player.addListener) {
-          player.addListener('playbackStatusUpdate', (status) => {
-            if (requestId !== playRequestIdRef.current) return;
-            if (status.duration) {
-              setDurationMillis(Math.round(status.duration * 1000));
-            }
-            if (status.currentTime !== undefined) {
-              setPositionMillis(Math.round(status.currentTime * 1000));
-            }
-            if (status.playing !== undefined) {
-              setIsPlaying(status.playing);
-            }
-            if (status.didJustFinish) {
-              handleNext();
-            }
-          });
-        }
-
-        player.play();
-        setIsPlaying(true);
-        setIsLoading(false);
-        return;
+      // 5. Try candidate audio URLs (direct CDN stream first, proxy fallback second)
+      const targetUrls = [audioData.audioUrl];
+      if (audioData.proxyUrl && audioData.proxyUrl !== audioData.audioUrl) {
+        targetUrls.push(audioData.proxyUrl);
       }
 
-      // B. Try legacy expo-av API
-      if (ExpoAudioModule?.Audio?.Sound) {
-        const { sound } = await ExpoAudioModule.Audio.Sound.createAsync(
-          { uri: audioData.audioUrl },
-          { shouldPlay: true },
-          (status) => {
-            if (requestId !== playRequestIdRef.current) return;
-            if (!status.isLoaded) return;
-            setPositionMillis(status.positionMillis || 0);
-            setDurationMillis(status.durationMillis || 0);
-            setIsPlaying(status.isPlaying);
-            if (status.didJustFinish && !status.isLooping) {
-              handleNext();
+      for (const uri of targetUrls) {
+        if (requestId !== playRequestIdRef.current) return;
+        try {
+          // A. Try modern expo-audio API
+          if (ExpoAudioModule?.createAudioPlayer) {
+            const player = ExpoAudioModule.createAudioPlayer({ uri });
+
+            if (requestId !== playRequestIdRef.current) {
+              if (player.release) player.release();
+              return;
             }
+
+            playerRef.current = player;
+
+            if (player.addListener) {
+              player.addListener('playbackStatusUpdate', (status) => {
+                if (requestId !== playRequestIdRef.current) return;
+                if (status.duration) {
+                  setDurationMillis(Math.round(status.duration * 1000));
+                }
+                if (status.currentTime !== undefined) {
+                  setPositionMillis(Math.round(status.currentTime * 1000));
+                }
+                if (status.playing !== undefined) {
+                  setIsPlaying(status.playing);
+                }
+                if (status.didJustFinish) {
+                  handleNext();
+                }
+              });
+            }
+
+            player.play();
+            setIsPlaying(true);
+            setIsLoading(false);
+            return;
           }
-        );
 
-        if (requestId !== playRequestIdRef.current) {
-          try {
-            await sound.unloadAsync();
-          } catch (e) {}
-          return;
+          // B. Try legacy expo-av API
+          if (ExpoAudioModule?.Audio?.Sound) {
+            const { sound } = await ExpoAudioModule.Audio.Sound.createAsync(
+              { uri },
+              { shouldPlay: true },
+              (status) => {
+                if (requestId !== playRequestIdRef.current) return;
+                if (!status.isLoaded) return;
+                setPositionMillis(status.positionMillis || 0);
+                setDurationMillis(status.durationMillis || 0);
+                setIsPlaying(status.isPlaying);
+                if (status.didJustFinish && !status.isLooping) {
+                  handleNext();
+                }
+              }
+            );
+
+            if (requestId !== playRequestIdRef.current) {
+              try {
+                await sound.unloadAsync();
+              } catch (e) {}
+              return;
+            }
+
+            playerRef.current = sound;
+            setIsPlaying(true);
+            setIsLoading(false);
+            return;
+          }
+        } catch (uriErr) {
+          console.warn(`Playback attempt failed for ${uri}:`, uriErr.message);
         }
-
-        playerRef.current = sound;
-        setIsPlaying(true);
-        setIsLoading(false);
-        return;
       }
 
       // C. Fallback simulation mode
