@@ -575,25 +575,41 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
         except Exception as oe_err:
             logger.debug(f"oEmbed title lookup failed for {video_id}: {oe_err}")
 
-    # 1. Primary Provider: mp3.pm (fast direct MP3, byte ranges, zero bot detection)
+    # Generate multi-query hint variations (typo tolerance e.g. loose <-> lose, and cleaned titles)
+    hints_to_try = [hint] if hint else []
     if hint:
-        mp3_res = _search_mp3_pm(hint)
+        if re.search(r"\bloose\b", hint, re.IGNORECASE):
+            variant = re.sub(r"\bloose\b", "lose", hint, flags=re.IGNORECASE)
+            if variant not in hints_to_try:
+                hints_to_try.append(variant)
+        elif re.search(r"\blose\b", hint, re.IGNORECASE):
+            variant = re.sub(r"\blose\b", "loose", hint, flags=re.IGNORECASE)
+            if variant not in hints_to_try:
+                hints_to_try.append(variant)
+
+        cleaned = _clean_search_query(hint)
+        if cleaned and cleaned not in hints_to_try:
+            hints_to_try.append(cleaned)
+
+    # 1. Primary Provider: mp3.pm (fast direct MP3, byte ranges, zero bot detection)
+    for h in hints_to_try:
+        mp3_res = _search_mp3_pm(h)
         if mp3_res:
             audio_url, title, dur = mp3_res
             _stream_cache[video_id] = (time.time(), audio_url, title, dur)
             return audio_url, title, dur
 
     # 2. Secondary Provider: JioSaavn 320kbps Akamai CDN stream
-    if hint:
-        saavn_res = _search_saavn(hint)
+    for h in hints_to_try:
+        saavn_res = _search_saavn(h)
         if saavn_res:
             audio_url, title, dur = saavn_res
             _stream_cache[video_id] = (time.time(), audio_url, title, dur)
             return audio_url, title, dur
 
     # 3. Tertiary Provider: SoundCloud via yt-dlp
-    if hint:
-        sc_res = _search_soundcloud(hint)
+    for h in hints_to_try:
+        sc_res = _search_soundcloud(h)
         if sc_res:
             audio_url, title, dur = sc_res
             _stream_cache[video_id] = (time.time(), audio_url, title, dur)
@@ -604,7 +620,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
     cookie_path = _get_cookie_file()
     po_token = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
     format_selector = "bestaudio/best"
-    fast_strategies = [[], ["web"], ["mweb"], ["android_vr"], ["android"]]
+    fast_strategies = [["android_vr"], ["mweb"], ["web"], []]
     last_error = None
 
     for clients in fast_strategies:
@@ -616,7 +632,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
-            "socket_timeout": 15,
+            "socket_timeout": 6,
             "retries": 1,
             "fragment_retries": 1,
             "js_runtimes": {"node": {}},
@@ -706,15 +722,25 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
     raise last_error or Exception("All audio extraction strategies failed")
 
 
-# Shared httpx client for connection reuse
+# Shared httpx client for connection reuse (loop-aware to prevent "Event loop is closed" errors)
 _http_client: Optional[httpx.AsyncClient] = None
+_client_bound_loop = None
 
 async def _get_http_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        # read=None allows infinite streaming without timing out mid-song
+    global _http_client, _client_bound_loop
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if (
+        _http_client is None
+        or _http_client.is_closed
+        or _client_bound_loop != current_loop
+    ):
         timeout = httpx.Timeout(connect=10.0, read=None, write=15.0, pool=15.0)
         _http_client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        _client_bound_loop = current_loop
     return _http_client
 
 @app.on_event("shutdown")
@@ -1213,12 +1239,16 @@ def get_stream_url(video_id: str):
 
 # ─── Download ──────────────────────────────────────────────────────────────────
 @app.get("/api/download/{video_id}")
-def download_song(
+async def download_song(
     video_id: str,
+    request: Request,
     title: Optional[str] = Query(None),
     artist: Optional[str] = Query(None),
 ):
-    """Extracts audio and streams it as MP3 via ffmpeg pipe."""
+    """
+    Extracts audio and streams it as MP3 with zero transcoding latency for direct CDN streams.
+    Bypasses CPU-heavy re-encoding on pre-encoded MP3/AAC streams to prevent 502 gateway timeouts.
+    """
     vid = _validate_video_id(video_id)
     hint = f"{artist or ''} {title or ''}".strip()
 
@@ -1230,7 +1260,69 @@ def download_song(
 
     safe_title = re.sub(r'[<>:"/\\|?*\r\n]', '', resolved_title or title or vid).strip() or vid
     filename = f"{safe_title}.mp3"
+    quoted_filename = quote(filename)
 
+    is_direct_audio = any(
+        cdn in audio_url
+        for cdn in ["mp3.pm", "saavncdn.com", "jiosaavn.com", "sndcdn.com", "soundcloud.cloud"]
+    )
+
+    client = await _get_http_client()
+
+    # Fast Path: Pre-encoded MP3/AAC CDN streams
+    if is_direct_audio:
+        try:
+            req_headers = {
+                "User-Agent": YDL_HEADERS["User-Agent"],
+                "Accept": "*/*",
+            }
+            if "mp3.pm" in audio_url:
+                req_headers["Referer"] = "https://mp3.pm/"
+            elif "saavncdn.com" in audio_url or "jiosaavn.com" in audio_url:
+                req_headers["Referer"] = "https://www.jiosaavn.com/"
+
+            range_header = request.headers.get("range")
+            if range_header:
+                req_headers["Range"] = range_header
+
+            try:
+                upstream_req = client.build_request("GET", audio_url, headers=req_headers)
+                upstream_resp = await client.send(upstream_req, stream=True)
+            except RuntimeError:
+                client = await _get_http_client()
+                upstream_req = client.build_request("GET", audio_url, headers=req_headers)
+                upstream_resp = await client.send(upstream_req, stream=True)
+
+            if upstream_resp and upstream_resp.status_code in (200, 206):
+                resp_headers = {
+                    "Content-Disposition": f'attachment; filename="{safe_title}.mp3"; filename*=UTF-8\'\'{quoted_filename}',
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "public, max-age=14400",
+                }
+                if "content-length" in upstream_resp.headers:
+                    resp_headers["Content-Length"] = upstream_resp.headers["content-length"]
+                if "content-range" in upstream_resp.headers:
+                    resp_headers["Content-Range"] = upstream_resp.headers["content-range"]
+
+                async def _stream_direct():
+                    try:
+                        async for chunk in upstream_resp.aiter_bytes(chunk_size=65536):
+                            yield chunk
+                    finally:
+                        await upstream_resp.aclose()
+
+                return StreamingResponse(
+                    _stream_direct(),
+                    status_code=upstream_resp.status_code,
+                    media_type="audio/mpeg",
+                    headers=resp_headers,
+                )
+            elif upstream_resp:
+                await upstream_resp.aclose()
+        except Exception as e:
+            logger.warning(f"Direct download stream failed for {vid}: {e}. Retrying with ffmpeg...")
+
+    # Fallback to FFmpeg with optimized fast encoding for YouTube streams
     ffmpeg_headers = f"User-Agent: {YDL_HEADERS['User-Agent']}\r\n"
     if "googlevideo.com" in audio_url:
         ffmpeg_headers += "Referer: https://www.youtube.com/\r\n"
@@ -1243,13 +1335,13 @@ def download_song(
         FFMPEG_PATH,
         "-reconnect", "1",
         "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "5",
+        "-reconnect_delay_max", "3",
         "-headers", ffmpeg_headers,
         "-i", audio_url,
         "-vn",
-        "-ar", "44100",
-        "-ac", "2",
-        "-b:a", "192k",
+        "-threads", "2",
+        "-c:a", "libmp3lame",
+        "-q:a", "4",
         "-f", "mp3",
         "pipe:1",
     ]
@@ -1276,7 +1368,7 @@ def download_song(
     return StreamingResponse(
         stream_audio(),
         media_type="audio/mpeg",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.mp3"; filename*=UTF-8\'\'{quoted_filename}'},
     )
 
 
