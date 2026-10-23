@@ -775,6 +775,32 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
     except Exception as pe:
         results["pot_provider_status"] = str(pe)
 
+    # Check formats available with default client
+    try:
+        ydl_opts_all = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "socket_timeout": 15,
+        }
+        if cookie_file and os.path.exists(cookie_file):
+            ydl_opts_all["cookiefile"] = cookie_file
+        with yt_dlp.YoutubeDL(ydl_opts_all) as ydl:
+            all_info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            results["available_formats"] = [
+                {
+                    "id": f.get("format_id"),
+                    "ext": f.get("ext"),
+                    "vcodec": f.get("vcodec"),
+                    "acodec": f.get("acodec"),
+                    "has_url": bool(f.get("url")),
+                    "protocol": f.get("protocol"),
+                }
+                for f in all_info.get("formats", [])
+            ]
+    except Exception as fe:
+        results["available_formats_error"] = str(fe)
+
     format_sel = "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best[height<=480]/best"
     for client in ["default", "web", "mweb", "android", "ios"]:
         try:
