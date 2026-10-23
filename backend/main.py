@@ -373,7 +373,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
     # 3. Mobile web (mweb)
     # 4. Default player
     # 5. Android player (without cookies)
-    fast_strategies = [["android_vr"], ["web"], ["mweb"], [], ["android"]]
+    fast_strategies = [["web"], ["mweb"], ["android_vr"], [], ["android"]]
     last_error = None
 
     for clients in fast_strategies:
@@ -390,6 +390,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
             "retries": 1,
             "fragment_retries": 1,
             "js_runtimes": {"node": {}},
+            "plugin_dirs": ["/pot", "/app", "/root/.yt-dlp-plugins", "default"],
         }
         # Only add desktop browser headers when NOT spoofing a mobile client
         if not any(c in ("android_vr", "android", "android_music", "ios") for c in clients):
@@ -437,7 +438,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
     # Instant Fallback: Search for high-fidelity audio version by title/artist
     if hint:
         logger.info(f"Direct extract failed for {video_id}. Instant search fallback with hint: '{hint}'")
-        for fallback_client in [["android_vr"], [], ["web"], ["android"]]:
+        for fallback_client in [["web"], ["mweb"], ["android_vr"], []]:
             try:
                 skip_cookie = any(c == "android" for c in fallback_client)
                 search_opts = {
@@ -448,6 +449,7 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
                     "socket_timeout": 15,
                     "retries": 1,
                     "js_runtimes": {"node": {}},
+                    "plugin_dirs": ["/pot", "/app", "/root/.yt-dlp-plugins", "default"],
                 }
                 if fallback_client:
                     search_opts["extractor_args"] = {"youtube": {"player_client": fallback_client}}
@@ -858,12 +860,14 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
         results["pot_provider_status"] = str(pe)
 
     # Check formats available with default client
+    results["pot_plugins_found"] = os.path.exists("/app/yt_dlp_plugins") or os.path.exists("/pot/yt_dlp_plugins")
     try:
         ydl_opts_all = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
             "socket_timeout": 15,
+            "plugin_dirs": ["/pot", "/app", "/root/.yt-dlp-plugins", "default"],
         }
         if cookie_file and os.path.exists(cookie_file):
             ydl_opts_all["cookiefile"] = cookie_file
@@ -884,7 +888,7 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
         results["available_formats_error"] = str(fe)
 
     format_sel = "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best[height<=480]/best"
-    for client in ["android_vr", "web", "mweb", "ios", "default", "android"]:
+    for client in ["web", "mweb", "android_vr", "ios", "default", "android"]:
         try:
             ydl_opts = {
                 "format": format_sel,
@@ -892,6 +896,7 @@ def debug_extract(video_id: str, title: Optional[str] = Query(None), artist: Opt
                 "no_warnings": True,
                 "skip_download": True,
                 "socket_timeout": 15,
+                "plugin_dirs": ["/pot", "/app", "/root/.yt-dlp-plugins", "default"],
             }
             if client != "default":
                 ydl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}

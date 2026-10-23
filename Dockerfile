@@ -8,11 +8,14 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Clone and build bgutil-ytdlp-pot-provider background server
+# Clone and build bgutil-ytdlp-pot-provider background server and install plugins
 RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /pot && \
     cd /pot/server && \
     npm ci && \
-    npx tsc
+    npx tsc && \
+    mkdir -p /root/.yt-dlp-plugins && \
+    cp -r /pot/yt_dlp_plugins /root/.yt-dlp-plugins/ && \
+    cp -r /pot/yt_dlp_plugins /app/yt_dlp_plugins
 
 # Copy and install backend Python dependencies
 COPY backend/requirements.txt .
