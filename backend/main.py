@@ -562,6 +562,19 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
         except Exception:
             pass
 
+    # Unauthenticated open metadata fallback via YouTube oEmbed
+    if not hint:
+        try:
+            oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+            req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                raw_title = data.get("title", "")
+                raw_author = re.sub(r" - Topic$", "", data.get("author_name", "")).strip()
+                hint = f"{raw_author} {raw_title}".strip()
+        except Exception as oe_err:
+            logger.debug(f"oEmbed title lookup failed for {video_id}: {oe_err}")
+
     # 1. Primary Provider: mp3.pm (fast direct MP3, byte ranges, zero bot detection)
     if hint:
         mp3_res = _search_mp3_pm(hint)
