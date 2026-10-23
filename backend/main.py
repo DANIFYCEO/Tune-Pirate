@@ -347,60 +347,59 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
 
     # Format selector: prioritize m4a/bestaudio, but automatically fall back to MP4 container
     # (AAC audio, itag 18 or 22) if YouTube enables SABR streaming on audio-only itags.
-    format_selector = "bestaudio[ext=m4a]/bestaudio/best[height<=360]/best[height<=480]/best"
+    format_selector = "bestaudio/best"
 
     # Prioritized client strategies:
-    # 1. Default (uses bgutil-ytdlp-pot-provider PO Token provider on 127.0.0.1:4416)
-    # 2. Web client with POT
-    # 3. Mobile web (mweb)
-    # 4. Android player
-    # 5. iOS player
-    fast_strategies = [[], ["web"], ["mweb"], ["android"], ["ios"]]
+    # 1. Android VR (extracts format 251 Opus audio cleanly without SABR blocks or cookie rejection)
+    # 2. Android player
+    # 3. Default (uses bgutil-ytdlp-pot-provider on 127.0.0.1:4416)
+    # 4. Web client
+    # 5. Mobile web (mweb)
+    fast_strategies = [["android_vr"], ["android"], [], ["web"], ["mweb"]]
     last_error = None
 
-    # Try extraction (first with cookies if available, and if invalid/failed, without cookies)
-    cookie_options = [cookie_path, None] if (cookie_path and os.path.exists(cookie_path)) else [None]
+    for clients in fast_strategies:
+        is_mobile = any(c in ("android_vr", "android", "android_music", "ios") for c in clients)
+        # Mobile/VR clients must NOT receive cookiefile, otherwise yt-dlp skips them
+        current_cookie = None if is_mobile else cookie_path
 
-    for current_cookie in cookie_options:
-        for clients in fast_strategies:
-            is_mobile = any(c in ("android", "android_music", "ios") for c in clients)
-            ydl_opts = {
-                "format": format_selector,
-                "quiet": True,
-                "no_warnings": True,
-                "skip_download": True,
-                "socket_timeout": 15,
-                "retries": 1,
-                "fragment_retries": 1,
-                "js_runtimes": {"node": {}},
-            }
-            # Only add desktop browser headers when NOT spoofing a mobile client
-            if not is_mobile:
-                ydl_opts["http_headers"] = YDL_HEADERS
+        ydl_opts = {
+            "format": format_selector,
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "socket_timeout": 15,
+            "retries": 1,
+            "fragment_retries": 1,
+            "js_runtimes": {"node": {}},
+        }
+        # Only add desktop browser headers when NOT spoofing a mobile client
+        if not is_mobile:
+            ydl_opts["http_headers"] = YDL_HEADERS
 
-            if current_cookie and os.path.exists(current_cookie):
-                ydl_opts["cookiefile"] = current_cookie
+        if current_cookie and os.path.exists(current_cookie):
+            ydl_opts["cookiefile"] = current_cookie
 
-            extractor_youtube = {}
-            if clients:
-                extractor_youtube["player_client"] = clients
-            if po_token:
-                extractor_youtube["po_token"] = [po_token if "+" in po_token else f"web+{po_token}"]
-            if extractor_youtube:
-                ydl_opts["extractor_args"] = {"youtube": extractor_youtube}
+        extractor_youtube = {}
+        if clients:
+            extractor_youtube["player_client"] = clients
+        if po_token:
+            extractor_youtube["po_token"] = [po_token if "+" in po_token else f"web+{po_token}"]
+        if extractor_youtube:
+            ydl_opts["extractor_args"] = {"youtube": extractor_youtube}
 
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    audio_url = info.get("url")
-                    title = info.get("title", "audio")
-                    duration = info.get("duration", 0)
-                    if audio_url:
-                        _stream_cache[video_id] = (time.time(), audio_url, title, duration)
-                        return audio_url, title, duration
-            except Exception as e:
-                last_error = e
-                logger.info(f"Direct yt-dlp extract failed for {video_id} (clients={clients}, cookie={bool(current_cookie)}): {e}")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                audio_url = info.get("url")
+                title = info.get("title", "audio")
+                duration = info.get("duration", 0)
+                if audio_url:
+                    _stream_cache[video_id] = (time.time(), audio_url, title, duration)
+                    return audio_url, title, duration
+        except Exception as e:
+            last_error = e
+            logger.info(f"Direct yt-dlp extract failed for {video_id} (clients={clients}, cookie={bool(current_cookie)}): {e}")
 
     # If direct extract failed, resolve query hint if not provided
     hint = (query_hint or "").strip()
@@ -415,45 +414,45 @@ def _extract_audio_url(video_id: str, query_hint: str = "", force_refresh: bool 
     # Instant Fallback: Search for high-fidelity audio version by title/artist
     if hint:
         logger.info(f"Direct extract failed for {video_id}. Instant search fallback with hint: '{hint}'")
-        for current_cookie in cookie_options:
-            for fallback_client in [["android"], []]:
-                try:
-                    search_opts = {
-                        "format": format_selector,
-                        "quiet": True,
-                        "no_warnings": True,
-                        "skip_download": True,
-                        "socket_timeout": 15,
-                        "retries": 1,
-                        "js_runtimes": {"node": {}},
-                    }
-                    if fallback_client:
-                        search_opts["extractor_args"] = {"youtube": {"player_client": fallback_client}}
-                    else:
-                        search_opts["http_headers"] = YDL_HEADERS
+        for fallback_client in [["android_vr"], ["android"], []]:
+            try:
+                is_mobile = any(c in ("android_vr", "android") for c in fallback_client)
+                search_opts = {
+                    "format": format_selector,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "skip_download": True,
+                    "socket_timeout": 15,
+                    "retries": 1,
+                    "js_runtimes": {"node": {}},
+                }
+                if fallback_client:
+                    search_opts["extractor_args"] = {"youtube": {"player_client": fallback_client}}
+                else:
+                    search_opts["http_headers"] = YDL_HEADERS
 
-                    if current_cookie and os.path.exists(current_cookie):
-                        search_opts["cookiefile"] = current_cookie
-                    if po_token:
-                        if "extractor_args" not in search_opts:
-                            search_opts["extractor_args"] = {"youtube": {}}
-                        search_opts["extractor_args"]["youtube"]["po_token"] = [
-                            po_token if "+" in po_token else f"web+{po_token}"
-                        ]
+                if not is_mobile and cookie_path and os.path.exists(cookie_path):
+                    search_opts["cookiefile"] = cookie_path
+                if po_token:
+                    if "extractor_args" not in search_opts:
+                        search_opts["extractor_args"] = {"youtube": {}}
+                    search_opts["extractor_args"]["youtube"]["po_token"] = [
+                        po_token if "+" in po_token else f"web+{po_token}"
+                    ]
 
-                    with yt_dlp.YoutubeDL(search_opts) as ydl:
-                        search_info = ydl.extract_info(f"ytsearch1:{hint} audio", download=False)
-                        if search_info and "entries" in search_info and search_info["entries"]:
-                            entry = search_info["entries"][0]
-                            audio_url = entry.get("url")
-                            title = entry.get("title", "audio")
-                            duration = entry.get("duration", 0)
-                            if audio_url:
-                                logger.info(f"Search fallback succeeded for {video_id} -> {entry.get('id')} ({title})")
-                                _stream_cache[video_id] = (time.time(), audio_url, title, duration)
-                                return audio_url, title, duration
-                except Exception as fallback_err:
-                    logger.warning(f"Fallback search failed for '{hint}' (clients={fallback_client}, cookie={bool(current_cookie)}): {fallback_err}")
+                with yt_dlp.YoutubeDL(search_opts) as ydl:
+                    search_info = ydl.extract_info(f"ytsearch1:{hint} audio", download=False)
+                    if search_info and "entries" in search_info and search_info["entries"]:
+                        entry = search_info["entries"][0]
+                        audio_url = entry.get("url")
+                        title = entry.get("title", "audio")
+                        duration = entry.get("duration", 0)
+                        if audio_url:
+                            logger.info(f"Search fallback succeeded for {video_id} -> {entry.get('id')} ({title})")
+                            _stream_cache[video_id] = (time.time(), audio_url, title, duration)
+                            return audio_url, title, duration
+            except Exception as fallback_err:
+                logger.warning(f"Fallback search failed for '{hint}' (clients={fallback_client}): {fallback_err}")
 
     raise last_error or Exception("All audio extraction strategies failed")
 
